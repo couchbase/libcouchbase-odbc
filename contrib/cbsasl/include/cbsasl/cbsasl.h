@@ -28,6 +28,7 @@ extern "C" {
 #define MECH_SCRAM_SHA1    "SCRAM-SHA1"
 #define MECH_SCRAM_SHA256  "SCRAM-SHA256"
 #define MECH_SCRAM_SHA512  "SCRAM-SHA512"
+#define MECH_OAUTHBEARER   "OAUTHBEARER"
 
 // size in bytes - to double if the nonce is displayed in hexadecimal
 #define SCRAM_NONCE_SIZE   8

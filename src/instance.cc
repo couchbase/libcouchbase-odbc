@@ -695,6 +695,7 @@ LIBCOUCHBASE_API
 void lcb_destroy(lcb_INSTANCE *instance)
 {
     instance->destroying = 1;
+
 #define DESTROY(fn, fld)                                                                                               \
     if (instance->fld) {                                                                                               \
         fn(instance->fld);                                                                                             \

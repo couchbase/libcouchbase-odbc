@@ -186,6 +186,14 @@ class lcb::SessionRequestImpl : public SessionRequest
     lcb_settings *settings;
     lcb_host_t host_{};
     bool expecting_error_map{false};
+
+    /**
+     * Pre-built SASL OAUTHBEARER initial-response payload.
+     * Non-empty iff the authenticator is in LCBAUTH_MODE_JWT.
+     * cbsasl is bypassed entirely when this is set; the field replaces the
+     * cbsasl_conn_t data/ndata output from cbsasl_client_start().
+     */
+    std::string oauthbearer_payload_{};
 };
 
 static void handle_read(lcbio_CTX *ioctx, unsigned)
@@ -225,13 +233,27 @@ SessionInfo::SessionInfo() : lcbio_PROTOCTX()
 
 bool SessionRequestImpl::setup(const lcbio_NAMEINFO &nistrs, const lcb_host_t &host, const lcb::Authenticator &auth)
 {
+    host_ = host;
+
+    /* JWT mode: bypass cbsasl entirely.
+     * OAUTHBEARER is a single-round-trip mechanism; the initial response is
+     * derived directly from the JWT, so cbsasl_client_new/start/step are
+     * never called.
+     */
+    if (auth.mode() == LCBAUTH_MODE_JWT) {
+        oauthbearer_payload_ = auth.jwt_sasl_payload();
+        sasl_client = nullptr;
+        lcb_log(LOGARGS(this, DEBUG), LOGFMT "JWT mode: SASL cbsasl bypassed, using OAUTHBEARER (%s)", LOGID(this),
+                auth.auth_summary().c_str());
+        return true;
+    }
+
     cbsasl_callbacks_t sasl_callbacks;
     sasl_callbacks.context = this;
     sasl_callbacks.username = sasl_get_username;
     sasl_callbacks.password = sasl_get_password;
 
     // Get the credentials
-    host_ = host;
     auto creds = auth.credentials_for(LCBAUTH_SERVICE_KEY_VALUE, LCBAUTH_REASON_NEW_OPERATION, host_.host, host_.port,
                                       settings->bucket);
     username = creds.username();
@@ -273,6 +295,35 @@ SessionRequestImpl::MechStatus SessionRequestImpl::set_chosen_mech(std::string &
         lcb_log(LOGARGS(this, WARN), LOGFMT "Server does not support SASL (no mechanisms supported, empty list)",
                 LOGID(this));
         return MECH_NOT_NEEDED;
+    }
+
+    /* JWT / OAUTHBEARER path — handled entirely outside cbsasl. */
+    if (!oauthbearer_payload_.empty()) {
+        /* LCB_CNTL_FORCE_SASL_MECH is ignored in JWT mode; OAUTHBEARER is always used. */
+        if (settings->sasl_mech_force != nullptr &&
+            std::string(settings->sasl_mech_force).find(MECH_OAUTHBEARER) == std::string::npos) {
+            lcb_log(LOGARGS(this, WARN), LOGFMT
+                    "JWT mode: LCB_CNTL_FORCE_SASL_MECH=%s is ignored; OAUTHBEARER is always used for JWT auth",
+                    LOGID(this), settings->sasl_mech_force);
+        }
+
+        /* Hard fail if OAUTHBEARER is absent — no silent downgrade. */
+        if (mechlist.find(MECH_OAUTHBEARER) == std::string::npos) {
+            lcb_log(LOGARGS(this, ERR), LOGFMT
+                    "JWT auth requires OAUTHBEARER but server only advertises: %s. "
+                    "Couchbase Server 8.1+ is required.",
+                    LOGID(this), mechlist.c_str());
+            set_error(LCB_ERR_SASLMECH_UNAVAILABLE,
+                      "Server does not advertise OAUTHBEARER; requires Couchbase Server 8.1+");
+            return MECH_UNAVAILABLE;
+        }
+
+        info->mech.assign(MECH_OAUTHBEARER);
+        *data  = oauthbearer_payload_.data();
+        *ndata = static_cast<unsigned int>(oauthbearer_payload_.size());
+        lcb_log(LOGARGS(this, DEBUG), LOGFMT "Using OAUTHBEARER SASL mechanism (JWT auth, %s)", LOGID(this),
+                settings->auth->auth_summary().c_str());
+        return MECH_OK;
     }
 
     bool tls = settings->ssl_ctx != nullptr;
@@ -676,7 +727,19 @@ GT_NEXT_PACKET:
                 completed = !maybe_select_bucket();
                 break;
             } else if (status == PROTOCOL_BINARY_RESPONSE_AUTH_CONTINUE) {
-                send_step(resp);
+                /* OAUTHBEARER is a single-round-trip mechanism; AUTH_CONTINUE
+                 * must never be returned for it.  Guard against a broken
+                 * server to avoid dereferencing the null sasl_client pointer. */
+                if (!oauthbearer_payload_.empty()) {
+                    lcb_log(LOGARGS(this, ERR), LOGFMT
+                            "JWT/OAUTHBEARER: unexpected SASL_CONTINUE from server "
+                            "(OAUTHBEARER is single-step; possible server misconfiguration)",
+                            LOGID(this));
+                    set_error(LCB_ERR_PROTOCOL_ERROR,
+                              "Unexpected SASL_CONTINUE for OAUTHBEARER (single-step mechanism)");
+                } else {
+                    send_step(resp);
+                }
             } else {
                 set_error(LCB_ERR_AUTHENTICATION_FAILURE, "SASL AUTH failed", &resp);
                 break;

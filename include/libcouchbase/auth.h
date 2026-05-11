@@ -409,7 +409,17 @@ typedef enum {
      * This mode allows to supply username/password with user-specified
      * callback. See lcbauth_set_callback().
      */
-    LCBAUTH_MODE_DYNAMIC = 2
+    LCBAUTH_MODE_DYNAMIC = 2,
+
+    /**
+     * Authenticate using a JSON Web Token (JWT) issued by an Identity
+     * Provider. Requires Couchbase Server 8.1 or later.
+     *
+     * KV connections authenticate via SASL OAUTHBEARER (single round-trip).
+     * HTTP services (Query, Search, Analytics, Views, Eventing, Management)
+     * use an Authorization: Bearer header.
+     */
+    LCBAUTH_MODE_JWT = 3
 } lcbauth_MODE;
 
 /**
@@ -426,6 +436,31 @@ typedef enum {
  */
 LIBCOUCHBASE_API
 lcb_STATUS lcbauth_set_mode(lcb_AUTHENTICATOR *src, lcbauth_MODE mode);
+
+/**
+ * @uncommitted
+ *
+ * Install a JWT on the authenticator and switch it into LCBAUTH_MODE_JWT.
+ *
+ * The token is structurally validated: it must have exactly three
+ * dot-separated Base64URL components, and the header and payload must be
+ * valid JSON objects. The library does NOT verify the JWT signature, that
+ * is a server-side concern.
+ *
+ * @param auth     The authenticator to configure.
+ * @param jwt      The encoded JWT string (need not be NUL-terminated).
+ * @param jwt_len  Length of @p jwt in bytes.
+ *
+ * @return LCB_SUCCESS on success.
+ * @return LCB_ERR_INVALID_ARGUMENT if the JWT is malformed.
+ * @return LCB_ERR_OPTIONS_CONFLICT if non-JWT credentials are already set.
+ *
+ * @note The raw token is never written to any log line. Only derived metadata
+ *       (e.g., the `exp` claim value) appears in log output.
+ *
+ */
+LIBCOUCHBASE_API
+lcb_STATUS lcbauth_set_jwt(lcb_AUTHENTICATOR *auth, const char *jwt, size_t jwt_len);
 
 /** @} */
 

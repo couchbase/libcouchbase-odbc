@@ -108,3 +108,5 @@ IF(NOT WIN32)
     ADD_EXAMPLE(threads-shared threads-shared pthread "")
     ADD_EXAMPLE(threads-private threads-private pthread "")
 ENDIF()
+
+ADD_EXAMPLE(analytics-jwt analytics-jwt "" "")

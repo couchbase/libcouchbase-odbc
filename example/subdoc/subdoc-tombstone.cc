@@ -16,6 +16,7 @@
  */
 
 #include <libcouchbase/couchbase.h>
+#include <cassert>
 #include <string>
 
 static void get_callback(lcb_INSTANCE *, int, const lcb_RESPGET *resp)

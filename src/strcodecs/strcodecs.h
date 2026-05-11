@@ -21,6 +21,7 @@
 #include <libcouchbase/couchbase.h>
 #include <cstddef>
 #include <string>
+#include <string.h>
 
 /**
  * Base64 encode a string into an output buffer.
@@ -44,6 +45,21 @@ int lcb_base64_encode2(const char *src, std::size_t len, char **dst, std::size_t
 
 std::ptrdiff_t lcb_base64_decode(const char *src, std::size_t nsrc, char *dst, std::size_t ndst);
 std::ptrdiff_t lcb_base64_decode2(const char *src, std::size_t nsrc, char **dst, std::size_t *ndst);
+
+/**
+ * Base64URL-decode a string (RFC 4648 §5) into an output buffer.
+ *
+ * Translates the URL-safe alphabet ('-' → '+', '_' → '/') and adds '='
+ * padding before delegating to lcb_base64_decode().
+ *
+ * @param src   Input Base64URL string (no NUL required).
+ * @param nsrc  Length of @p src in bytes.
+ * @param dst   Output buffer.
+ * @param ndst  Size of @p dst.
+ * @return Number of decoded bytes written, or -1 on error (invalid characters
+ *         or output buffer too small).
+ */
+std::ptrdiff_t lcb_base64url_decode(const char *src, std::size_t nsrc, char *dst, std::size_t ndst);
 
 void lcb_base64_encode_iov(lcb_IOV *iov, unsigned niov, unsigned nb, char **dst, int *ndst);
 

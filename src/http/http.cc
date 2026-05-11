@@ -645,15 +645,28 @@ lcb_STATUS Request::setup_inputs(const lcb_CMDHTTP *cmd)
             }
         }
 
-        if ((cmd->cmdflags & LCB_CMDHTTP_F_NOUPASS) ||
-            (instance->settings->keypath && !instance->settings->use_credentials_with_client_certificate)) {
+        /* auth_suppressed is true when the caller explicitly opts out of any
+         * Authorization header (NOUPASS flag) or when TLS client-certificate
+         * authentication is in use without extra credentials.  It gates both
+         * the Basic auth and the JWT Bearer paths below. */
+        bool auth_suppressed =
+            (cmd->cmdflags & LCB_CMDHTTP_F_NOUPASS) != 0 ||
+            (instance->settings->keypath && !instance->settings->use_credentials_with_client_certificate);
+
+        if (auth_suppressed) {
             // explicitly asked to skip Authorization header,
             // or using SSL client certificate to authenticate with use_credentials_with_client_certificate=false
             username.clear();
             password.clear();
         } else if (username.empty() && password.empty()) {
             const Authenticator &auth = *LCBT_SETTING(instance, auth);
-            if (reqtype == LCB_HTTP_TYPE_MANAGEMENT) {
+            if (auth.mode() == LCBAUTH_MODE_JWT) {
+                /* JWT mode: no username/password — the Authorization: Bearer
+                 * header is emitted below after URL assignment.
+                 * credentials_for() already returns empty creds for JWT mode;
+                 * this branch makes the intent explicit and avoids the
+                 * MANAGEMENT / DYNAMIC special-casing below. */
+            } else if (reqtype == LCB_HTTP_TYPE_MANAGEMENT) {
                 username = auth.username();
                 password = auth.password();
             } else {
@@ -700,14 +713,26 @@ lcb_STATUS Request::setup_inputs(const lcb_CMDHTTP *cmd)
     }
 
     add_header("Accept", "application/json");
-    if (!username.empty()) {
-        char auth[256];
-        std::string upassbuf;
-        upassbuf.append(username).append(":").append(password);
-        if (lcb_base64_encode(upassbuf.c_str(), upassbuf.size(), auth, sizeof(auth)) == -1) {
-            return LCB_ERR_INVALID_ARGUMENT;
+    {
+        /* Emit Authorization header: Bearer for JWT, Basic otherwise. */
+        const Authenticator &lcb_auth = *LCBT_SETTING(instance, auth);
+        bool suppressed =
+            (cmd->cmdflags & LCB_CMDHTTP_F_NOUPASS) != 0 ||
+            (instance->settings->keypath && !instance->settings->use_credentials_with_client_certificate);
+
+        if (!suppressed && lcb_auth.mode() == LCBAUTH_MODE_JWT) {
+            add_header("Authorization", lcb_auth.jwt_bearer_header());
+            lcb_log(LOGARGS(this, DEBUG), LOGFMT "HTTP auth: JWT Bearer %s", LOGID(this),
+                    lcb_auth.auth_summary().c_str());
+        } else if (!username.empty()) {
+            char auth_buf[256];
+            std::string upassbuf;
+            upassbuf.append(username).append(":").append(password);
+            if (lcb_base64_encode(upassbuf.c_str(), upassbuf.size(), auth_buf, sizeof(auth_buf)) == -1) {
+                return LCB_ERR_INVALID_ARGUMENT;
+            }
+            add_header("Authorization", std::string("Basic ") + auth_buf);
         }
-        add_header("Authorization", std::string("Basic ") + auth);
     }
 
     if (!body.empty()) {

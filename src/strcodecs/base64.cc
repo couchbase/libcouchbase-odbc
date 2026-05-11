@@ -315,3 +315,25 @@ std::ptrdiff_t lcb_base64_decode2(const char *src, std::size_t nsrc, char **dst,
     }
     return rc;
 }
+
+std::ptrdiff_t lcb_base64url_decode(const char *src, std::size_t nsrc, char *dst, std::size_t ndst)
+{
+    /* Translate Base64URL alphabet (RFC 4648 §5) to standard Base64:
+     *   '-' (0x2D) -> '+' (0x2B)
+     *   '_' (0x5F) -> '/' (0x2F)
+     * then add '=' padding to reach a multiple of 4 bytes.
+     */
+    std::string s(src, nsrc);
+    for (char &c : s) {
+        if (c == '-') {
+            c = '+';
+        } else if (c == '_') {
+            c = '/';
+        }
+    }
+    /* Pad to the next multiple of 4 */
+    while (s.size() % 4 != 0) {
+        s += '=';
+    }
+    return lcb_base64_decode(s.c_str(), s.size(), dst, ndst);
+}
