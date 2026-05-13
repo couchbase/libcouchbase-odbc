@@ -283,6 +283,25 @@ TEST_F(JwtAuthTest, JwtModeConflictWithExistingCreds)
     lcbauth_unref(auth);
 }
 
+TEST_F(JwtAuthTest, JwtRequiresTlsOnCreate)
+{
+    lcb_AUTHENTICATOR *auth = lcbauth_new();
+    ASSERT_EQ(LCB_SUCCESS, lcbauth_set_jwt(auth, VALID_JWT, strlen(VALID_JWT)));
+
+    lcb_CREATEOPTS *opts = nullptr;
+    ASSERT_EQ(LCB_SUCCESS, lcb_createopts_create(&opts, LCB_TYPE_BUCKET));
+    const char *connstr = "couchbase://localhost/default";
+    ASSERT_EQ(LCB_SUCCESS, lcb_createopts_connstr(opts, connstr, strlen(connstr)));
+    ASSERT_EQ(LCB_SUCCESS, lcb_createopts_authenticator(opts, auth));
+
+    lcb_INSTANCE *instance = nullptr;
+    EXPECT_EQ(LCB_ERR_OPTIONS_CONFLICT, lcb_create(&instance, opts));
+    EXPECT_EQ(nullptr, instance);
+
+    lcb_createopts_destroy(opts);
+    lcbauth_unref(auth);
+}
+
 /* =========================================================================
  * Log redaction
  * ========================================================================= */

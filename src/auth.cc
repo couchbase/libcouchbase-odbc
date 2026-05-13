@@ -28,7 +28,10 @@ using namespace lcb;
 
 /**
  * Decode a single Base64URL component (header or payload) from @p part into
- * a NULL-terminated std::string.  Returns an empty string on error.
+ * a NUL-terminated std::string via the @p out parameter.
+ *
+ * @return true on success, false if the component is empty or contains
+ *         invalid Base64URL characters.
  */
 static bool decode_jwt_component(const std::string &part, std::string &out)
 {

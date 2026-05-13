@@ -483,6 +483,12 @@ lcb_STATUS lcb_create(lcb_INSTANCE **instance, const lcb_CREATEOPTS *options)
         goto GT_DONE;
     }
 
+    if (options != nullptr && options->auth != nullptr && options->auth->mode() == LCBAUTH_MODE_JWT &&
+        (spec.sslopts() & LCB_SSL_ENABLED) == 0) {
+        err = LCB_ERR_OPTIONS_CONFLICT;
+        goto GT_DONE;
+    }
+
     {
         // Warn users if they attempt to use Capella without TLS being enabled.
         bool is_capella = false;
