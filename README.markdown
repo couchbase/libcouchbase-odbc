@@ -14,7 +14,7 @@ always welcome on [our forum](https://forums.couchbase.com/c/c-sdk) and [Discord
 ## Features
 
 * Can function as either a synchronous or asynchronous library
-* Callback Oriented
+* Callback oriented
 * Can integrate with most other asynchronous environments. You can write your
   code to integrate it into your environment. Currently support exists for
     * [libuv](http://github.com/joyent/libuv) (Windows and POSIX)
