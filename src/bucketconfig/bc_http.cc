@@ -260,13 +260,17 @@ lcb_STATUS HttpProvider::setup_request_header(const lcb_host_t &host)
         auto creds = settings().auth->credentials_for(LCBAUTH_SERVICE_MANAGEMENT, LCBAUTH_REASON_NEW_OPERATION,
                                                       host.host, host.port, settings().bucket);
         if (creds.result() == LCBAUTH_RESULT_OK) {
-            std::string cred;
-            cred.append(creds.username()).append(":").append(creds.password());
-            char b64[256] = {0};
-            if (lcb_base64_encode(cred.c_str(), cred.size(), b64, sizeof(b64)) == -1) {
-                return LCB_ERR_SDK_INTERNAL;
+            if (settings().auth->mode() == LCBAUTH_MODE_JWT) {
+                request_buf.append("Authorization: ").append(settings().auth->jwt_bearer_header()).append("\r\n");
+            } else {
+                std::string cred;
+                cred.append(creds.username()).append(":").append(creds.password());
+                char b64[256] = {0};
+                if (lcb_base64_encode(cred.c_str(), cred.size(), b64, sizeof(b64)) == -1) {
+                    return LCB_ERR_SDK_INTERNAL;
+                }
+                request_buf.append("Authorization: Basic ").append(b64).append("\r\n");
             }
-            request_buf.append("Authorization: Basic ").append(b64).append("\r\n");
         } else {
             return LCB_ERR_AUTHENTICATION_FAILURE;
         }
