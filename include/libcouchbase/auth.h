@@ -413,7 +413,7 @@ typedef enum {
 
     /**
      * Authenticate using a JSON Web Token (JWT) issued by an Identity
-     * Provider. Requires Couchbase Server 8.1 or later.
+     * Provider.
      *
      * KV connections authenticate via SASL OAUTHBEARER (single round-trip).
      * HTTP services (Query, Search, Analytics, Views, Eventing, Management)

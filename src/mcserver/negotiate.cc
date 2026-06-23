@@ -311,10 +311,9 @@ SessionRequestImpl::MechStatus SessionRequestImpl::set_chosen_mech(std::string &
         if (mechlist.find(MECH_OAUTHBEARER) == std::string::npos) {
             lcb_log(LOGARGS(this, ERR), LOGFMT
                     "JWT auth requires OAUTHBEARER but server only advertises: %s. "
-                    "Couchbase Server 8.1+ is required.",
                     LOGID(this), mechlist.c_str());
             set_error(LCB_ERR_SASLMECH_UNAVAILABLE,
-                      "Server does not advertise OAUTHBEARER; requires Couchbase Server 8.1+");
+                      "Server does not advertise OAUTHBEARER");
             return MECH_UNAVAILABLE;
         }
 
