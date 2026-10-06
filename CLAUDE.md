@@ -3,6 +3,14 @@
 Orientation + behaviour reference for this repo. Read this before grepping; it names the file to open
 for each subsystem so you don't have to rediscover the layout.
 
+## Rules (always apply)
+
+- Commit messages: subject line ≤ 72 chars, body wrapped at 72.
+- No comments that restate the code. Comment only non-obvious *why* (invariants, workarounds,
+  protocol quirks), in one short line.
+- Don't add tests unless asked or the change is a real behaviour fix. Prefer extending an existing
+  case in `tests/basic/` over new fixtures, mocks, or iotests that need CouchbaseMock or a cluster.
+
 ## What this is
 
 `libcouchbase` — the Couchbase **C** SDK ("LCB"), version **3.3.19** (`CMakeLists.txt:35`), forked as
