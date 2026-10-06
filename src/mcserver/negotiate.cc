@@ -310,7 +310,7 @@ SessionRequestImpl::MechStatus SessionRequestImpl::set_chosen_mech(std::string &
         /* Hard fail if OAUTHBEARER is absent — no silent downgrade. */
         if (mechlist.find(MECH_OAUTHBEARER) == std::string::npos) {
             lcb_log(LOGARGS(this, ERR), LOGFMT
-                    "JWT auth requires OAUTHBEARER but server only advertises: %s. "
+                    "JWT auth requires OAUTHBEARER but server only advertises: %s. ",
                     LOGID(this), mechlist.c_str());
             set_error(LCB_ERR_SASLMECH_UNAVAILABLE,
                       "Server does not advertise OAUTHBEARER");
