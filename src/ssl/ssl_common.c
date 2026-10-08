@@ -26,6 +26,12 @@
 #include <openssl/opensslv.h>
 #include <openssl/ssl.h>
 
+#ifdef _WIN32
+/* wincrypt.h requires the base types from windows.h */
+#include <windows.h>
+#include <wincrypt.h>
+#endif
+
 #if OPENSSL_VERSION_NUMBER >= 0x1010100fL
 #define HAVE_CIPHERSUITES 1
 #endif
@@ -431,6 +437,66 @@ static int keyfile_password_cb(char *buf, int size, int rwflag, void *userdata)
     return secret->password_len;
 }
 
+int lcbio_ssl_add_der_cert(lcbio_pSSLCTX sctx, const unsigned char *der, long len)
+{
+    X509 *x509;
+    int added;
+
+    if (sctx == NULL || sctx->ctx == NULL || der == NULL || len <= 0) {
+        return 0;
+    }
+    x509 = d2i_X509(NULL, &der, len);
+    if (x509 == NULL) {
+        /* Don't leave the decode error for a later ERR_get_error() caller */
+        ERR_clear_error();
+        return 0;
+    }
+    added = X509_STORE_add_cert(SSL_CTX_get_cert_store(sctx->ctx), x509) == 1;
+    if (!added) {
+        /* Before OpenSSL 3.0 a duplicate is reported as an error */
+        ERR_clear_error();
+    }
+    X509_free(x509);
+    return added;
+}
+
+#ifdef _WIN32
+/*
+ * SSL_CTX_set_default_verify_paths() reads only OpenSSL's OPENSSLDIR bundle,
+ * which is normally absent on Windows, so the OS trust store has to be read
+ * through CryptoAPI.
+ */
+static void add_windows_root_store_certs(const lcb_settings *settings, lcbio_pSSLCTX sctx)
+{
+    static const DWORD store_locations[] = {CERT_SYSTEM_STORE_LOCAL_MACHINE, CERT_SYSTEM_STORE_CURRENT_USER};
+    /* ROOT holds the trust anchors; CA holds intermediates. OpenSSL does not
+     * fetch issuers via AIA, so without CA a server that sends only its leaf
+     * cannot be chained to a root that is present. */
+    static const wchar_t *store_names[] = {L"ROOT", L"CA"};
+    int added = 0;
+    size_t i, j;
+
+    for (i = 0; i < sizeof(store_locations) / sizeof(store_locations[0]); i++) {
+        for (j = 0; j < sizeof(store_names) / sizeof(store_names[0]); j++) {
+            HCERTSTORE hStore = CertOpenStore(CERT_STORE_PROV_SYSTEM, 0, (HCRYPTPROV_LEGACY)NULL,
+                                              store_locations[i] | CERT_STORE_READONLY_FLAG, store_names[j]);
+            PCCERT_CONTEXT cert_ctx = NULL;
+
+            if (!hStore) {
+                continue;
+            }
+
+            while ((cert_ctx = CertEnumCertificatesInStore(hStore, cert_ctx)) != NULL) {
+                added += lcbio_ssl_add_der_cert(sctx, cert_ctx->pbCertEncoded, (long)cert_ctx->cbCertEncoded);
+            }
+            CertCloseStore(hStore, 0);
+        }
+    }
+
+    lcb_log(LOGARGS_S(settings, LCB_LOG_DEBUG), "Added %d certificate(s) from the Windows trust store", added);
+}
+#endif
+
 lcbio_pSSLCTX lcbio_ssl_new(const char *tsfile, const char *cafile, const char *keyfile, const char *keypass,
                             size_t keypass_len, int noverify, lcb_STATUS *errp, lcb_settings *settings)
 {
@@ -503,6 +569,13 @@ lcbio_pSSLCTX lcbio_ssl_new(const char *tsfile, const char *cafile, const char *
             goto GT_ERR;
         }
     }
+
+#ifdef _WIN32
+    /* Always, so truststorepath is a fallback to the Windows store, not a replacement. */
+    if (!noverify) {
+        add_windows_root_store_certs(settings, ret);
+    }
+#endif
 
     if (cafile && keyfile) {
         lcb_log(LOGARGS_S(settings, LCB_LOG_DEBUG), "Authenticate with key \"%s\"%s, cert \"%s\"", keyfile,

@@ -78,6 +78,15 @@ lcbio_pSSLCTX lcbio_ssl_new__fallback(const char *, const char *, const char *, 
  */
 lcbio_pSSLCTX lcbio_ssl_new(const char *tsfile, const char *cafile, const char *keyfile, const char *keypass,
                             size_t keypass_len, int noverify, lcb_STATUS *errp, lcb_settings *settings);
+
+/**
+ * Decode a DER-encoded certificate and add it to @p sctx's trust store.
+ * Leaves the OpenSSL error queue clean.
+ *
+ * @return 1 if added, 0 on bad arguments, undecodable input or (before
+ *         OpenSSL 3.0) a duplicate.
+ */
+int lcbio_ssl_add_der_cert(lcbio_pSSLCTX sctx, const unsigned char *der, long len);
 #else
 #define lcbio_ssl_new lcbio_ssl_new__fallback
 #endif
