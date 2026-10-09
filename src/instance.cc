@@ -631,6 +631,11 @@ lcb_STATUS lcb_create(lcb_INSTANCE **instance, const lcb_CREATEOPTS *options)
     if ((err = apply_env_options(obj)) != LCB_SUCCESS) {
         goto GT_DONE;
     }
+    /* Here rather than in the cntl handler: the logger may be set by a later connstr option. */
+    if ((settings->sslopts & LCB_SSL_ENABLED) && !settings->ssl_verify_hostname) {
+        lcb_log(LOGARGS(obj, WARN),
+                "TLS hostname verification is disabled: any trusted certificate is accepted for any server");
+    }
 
     if ((err = obj->process_dns_srv(spec)) != LCB_SUCCESS) {
         goto GT_DONE;

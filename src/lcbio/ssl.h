@@ -87,6 +87,15 @@ lcbio_pSSLCTX lcbio_ssl_new(const char *tsfile, const char *cafile, const char *
  *         OpenSSL 3.0) a duplicate.
  */
 int lcbio_ssl_add_der_cert(lcbio_pSSLCTX sctx, const unsigned char *der, long len);
+
+/**
+ * Require the peer certificate to match @p host: an IP literal must match an
+ * IP address SAN, anything else a DNS name.
+ *
+ * @return 1 on success, 0 on bad arguments or allocation failure.
+ */
+struct X509_VERIFY_PARAM_st;
+int lcbio_ssl_set_expected_host(struct X509_VERIFY_PARAM_st *param, const char *host);
 #else
 #define lcbio_ssl_new lcbio_ssl_new__fallback
 #endif

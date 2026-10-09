@@ -306,4 +306,15 @@ struct lcb_cntl_rdballocfactory {
  */
 #define LCB_CNTL_USE_CREDENTIALS_WITH_CLIENT_CERTIFICATE 0x69
 
+/**
+ * @brief Check that the server certificate matches the host connected to (default on).
+ *
+ * Use `verify_hostname` in the connection string. Turning it off over TLS logs a
+ * warning when the instance is created.
+ *
+ * @cntl_arg_both{int*}
+ * @volatile
+ */
+#define LCB_CNTL_VERIFY_HOSTNAME 0x6a
+
 /**@}*/

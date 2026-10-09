@@ -87,6 +87,7 @@ void lcb_default_settings(lcb_settings *settings)
     settings->op_metrics_enabled = 1;
     settings->preferred_server_group = nullptr;
     settings->use_credentials_with_client_certificate = 0;
+    settings->ssl_verify_hostname = 1;
 }
 
 LCB_INTERNAL_API

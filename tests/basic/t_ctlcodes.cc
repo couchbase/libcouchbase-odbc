@@ -132,3 +132,13 @@ TEST_F(CtlTest, testTimeDurationParsing)
 
     lcb_destroy(instance);
 }
+
+TEST_F(CtlTest, testVerifyHostname)
+{
+    lcb_INSTANCE *instance;
+    ASSERT_EQ(LCB_SUCCESS, lcb_create(&instance, nullptr));
+    ASSERT_EQ(1, getSetting<int>(instance, LCB_CNTL_VERIFY_HOSTNAME));
+    ASSERT_STATUS_EQ(LCB_SUCCESS, lcb_cntl_string(instance, "verify_hostname", "false"));
+    ASSERT_EQ(0, getSetting<int>(instance, LCB_CNTL_VERIFY_HOSTNAME));
+    lcb_destroy(instance);
+}

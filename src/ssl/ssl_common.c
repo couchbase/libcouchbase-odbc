@@ -282,8 +282,8 @@ static int verify_callback(int preverify_ok, X509_STORE_CTX *store_ctx)
     }
 
     lcb_log(LOGARGS(ssl, LCB_LOG_ERROR),
-            "Peer certificate verification failed at depth %d: %s (%d). subject=%s issuer=%s", depth,
-            X509_verify_cert_error_string(err), err, subject, issuer);
+            "Peer certificate verification failed at depth %d: %s (%d). host=%s subject=%s issuer=%s", depth,
+            X509_verify_cert_error_string(err), err, lcbio_get_host(sock)->host, subject, issuer);
 
     return preverify_ok;
 }
@@ -458,6 +458,17 @@ int lcbio_ssl_add_der_cert(lcbio_pSSLCTX sctx, const unsigned char *der, long le
     }
     X509_free(x509);
     return added;
+}
+
+int lcbio_ssl_set_expected_host(X509_VERIFY_PARAM *param, const char *host)
+{
+    if (param == NULL || host == NULL || *host == '\0') {
+        return 0;
+    }
+    if (X509_VERIFY_PARAM_set1_ip_asc(param, host) == 1) {
+        return 1;
+    }
+    return X509_VERIFY_PARAM_set1_host(param, host, 0) == 1;
 }
 
 #ifdef _WIN32
@@ -674,6 +685,12 @@ lcb_STATUS lcbio_ssl_apply(lcbio_SOCKET *sock, lcbio_pSSLCTX sctx)
     }
 
     if (new_iot) {
+        /* Otherwise any trusted certificate is accepted for any server. */
+        if (sock->settings->ssl_verify_hostname &&
+            !lcbio_ssl_set_expected_host(SSL_get0_param(((lcbio_XSSL *)new_iot)->ssl), lcbio_get_host(sock)->host)) {
+            lcbio_table_unref(new_iot);
+            return LCB_ERR_SSL_ERROR;
+        }
         sproto = calloc(1, sizeof(*sproto));
         sproto->proto.id = LCBIO_PROTOCTX_SSL;
         sproto->proto.dtor = noop_dtor;

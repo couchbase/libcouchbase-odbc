@@ -24,6 +24,7 @@
 
 #include <lcbio/ssl.h>
 #include <openssl/err.h>
+#include <openssl/x509.h>
 
 /* Self-signed P-256 certificate, "CN=lcb test trust anchor" */
 static const unsigned char TEST_DER_CERT[] = {
@@ -103,6 +104,52 @@ TEST_F(SslTrustTest, RejectsInvalidArguments)
     EXPECT_EQ(0, lcbio_ssl_add_der_cert(nullptr, TEST_DER_CERT, sizeof(TEST_DER_CERT)));
     EXPECT_EQ(0, lcbio_ssl_add_der_cert(sctx, nullptr, 10));
     EXPECT_EQ(0, lcbio_ssl_add_der_cert(sctx, TEST_DER_CERT, 0));
+}
+
+/* Verifies TEST_DER_CERT against itself, optionally requiring @p host. */
+static int verify_test_cert(const char *host)
+{
+    const unsigned char *p = TEST_DER_CERT;
+    X509 *cert = d2i_X509(nullptr, &p, sizeof(TEST_DER_CERT));
+    X509_STORE *store = X509_STORE_new();
+    X509_STORE_CTX *ctx = X509_STORE_CTX_new();
+    X509_STORE_add_cert(store, cert);
+    X509_STORE_CTX_init(ctx, store, cert, nullptr);
+    if (host != nullptr) {
+        EXPECT_EQ(1, lcbio_ssl_set_expected_host(X509_STORE_CTX_get0_param(ctx), host));
+    }
+    X509_verify_cert(ctx);
+    int err = X509_STORE_CTX_get_error(ctx);
+    X509_STORE_CTX_free(ctx);
+    X509_STORE_free(store);
+    X509_free(cert);
+    ERR_clear_error();
+    return err;
+}
+
+TEST(SslHostTest, AcceptsWithoutExpectedHost)
+{
+    EXPECT_EQ(X509_V_OK, verify_test_cert(nullptr));
+}
+
+TEST(SslHostTest, RejectsHostnameMismatch)
+{
+    EXPECT_EQ(X509_V_ERR_HOSTNAME_MISMATCH, verify_test_cert("db.example.com"));
+}
+
+TEST(SslHostTest, RejectsIpAddressMismatch)
+{
+    EXPECT_EQ(X509_V_ERR_IP_ADDRESS_MISMATCH, verify_test_cert("10.0.0.1"));
+    EXPECT_EQ(X509_V_ERR_IP_ADDRESS_MISMATCH, verify_test_cert("::1"));
+}
+
+TEST(SslHostTest, RejectsInvalidArguments)
+{
+    X509_VERIFY_PARAM *param = X509_VERIFY_PARAM_new();
+    EXPECT_EQ(0, lcbio_ssl_set_expected_host(nullptr, "db.example.com"));
+    EXPECT_EQ(0, lcbio_ssl_set_expected_host(param, nullptr));
+    EXPECT_EQ(0, lcbio_ssl_set_expected_host(param, ""));
+    X509_VERIFY_PARAM_free(param);
 }
 
 #endif /* LCB_NO_SSL */
