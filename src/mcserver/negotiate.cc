@@ -143,6 +143,16 @@ class lcb::SessionRequestImpl : public SessionRequest
         if (packet) {
             MemcachedResponse::parse_enhanced_error(packet->value(), packet->vallen(), &err_ref, &err_ctx);
         }
+        /* JWT claims are otherwise only logged at DEBUG; claims are user data. */
+        std::string auth_info;
+        if (error == LCB_ERR_AUTHENTICATION_FAILURE && settings->auth != nullptr &&
+            settings->auth->mode() == LCBAUTH_MODE_JWT) {
+            const std::string summary = settings->auth->auth_summary();
+            if (!summary.empty()) {
+                auth_info = settings->log_redaction ? " " LCB_LOG_UD_OTAG + summary + LCB_LOG_UD_CTAG : " " + summary;
+            }
+        }
+
         if (err_ref || err_ctx) {
             std::stringstream emsg;
             if (err_ref) {
@@ -154,11 +164,12 @@ class lcb::SessionRequestImpl : public SessionRequest
                 }
                 emsg << "context: \"" << err_ctx << "\"";
             }
-            lcb_log(LOGARGS(this, ERR), LOGFMT "Error: 0x%x, %s (%s)", LOGID(this), error, msg, emsg.str().c_str());
+            lcb_log(LOGARGS(this, ERR), LOGFMT "Error: 0x%x, %s (%s)%s", LOGID(this), error, msg, emsg.str().c_str(),
+                    auth_info.c_str());
             free(err_ref);
             free(err_ctx);
         } else {
-            lcb_log(LOGARGS(this, ERR), LOGFMT "Error: 0x%x, %s", LOGID(this), error, msg);
+            lcb_log(LOGARGS(this, ERR), LOGFMT "Error: 0x%x, %s%s", LOGID(this), error, msg, auth_info.c_str());
         }
         if (last_err == LCB_SUCCESS) {
             last_err = error;

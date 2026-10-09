@@ -240,6 +240,48 @@ int iotssl_maybe_error(lcbio_XSSL *xs, int rv)
  ** Higher Level SSL_CTX Wrappers                                            **
  ******************************************************************************
  ******************************************************************************/
+/**
+ * Logs why peer verification failed, including the offending certificate.
+ * Purely diagnostic: @p preverify_ok is returned unchanged, so the trust
+ * decision is exactly what OpenSSL already made.
+ */
+static int verify_callback(int preverify_ok, X509_STORE_CTX *store_ctx)
+{
+    SSL *ssl;
+    lcbio_SOCKET *sock;
+    X509 *cert;
+    int err, depth;
+    char subject[256] = {0};
+    char issuer[256] = {0};
+
+    if (preverify_ok) {
+        return preverify_ok;
+    }
+
+    ssl = X509_STORE_CTX_get_ex_data(store_ctx, SSL_get_ex_data_X509_STORE_CTX_idx());
+    if (ssl == NULL) {
+        return preverify_ok;
+    }
+    sock = SSL_get_app_data(ssl);
+    if (sock == NULL) {
+        return preverify_ok;
+    }
+
+    err = X509_STORE_CTX_get_error(store_ctx);
+    depth = X509_STORE_CTX_get_error_depth(store_ctx);
+    cert = X509_STORE_CTX_get_current_cert(store_ctx);
+    if (cert != NULL) {
+        X509_NAME_oneline(X509_get_subject_name(cert), subject, sizeof(subject) - 1);
+        X509_NAME_oneline(X509_get_issuer_name(cert), issuer, sizeof(issuer) - 1);
+    }
+
+    lcb_log(LOGARGS(ssl, LCB_LOG_ERROR),
+            "Peer certificate verification failed at depth %d: %s (%d). subject=%s issuer=%s", depth,
+            X509_verify_cert_error_string(err), err, subject, issuer);
+
+    return preverify_ok;
+}
+
 static void log_callback(const SSL *ssl, int where, int ret)
 {
     int should_log = 0;
@@ -489,7 +531,7 @@ lcbio_pSSLCTX lcbio_ssl_new(const char *tsfile, const char *cafile, const char *
     if (noverify) {
         SSL_CTX_set_verify(ret->ctx, SSL_VERIFY_NONE, NULL);
     } else {
-        SSL_CTX_set_verify(ret->ctx, SSL_VERIFY_PEER, NULL);
+        SSL_CTX_set_verify(ret->ctx, SSL_VERIFY_PEER, verify_callback);
     }
 
     SSL_CTX_set_info_callback(ret->ctx, log_callback);

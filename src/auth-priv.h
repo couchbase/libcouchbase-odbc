@@ -153,7 +153,9 @@ class Authenticator
         : buckets_{other.buckets_}, username_{other.username_}, password_{other.password_}, mode_{other.mode_},
           cookie_{other.cookie_}, callback_{other.callback_},
           jwt_{other.jwt_}, jwt_bearer_header_{other.jwt_bearer_header_},
-          jwt_sasl_payload_{other.jwt_sasl_payload_}, jwt_exp_seconds_{other.jwt_exp_seconds_}
+          jwt_sasl_payload_{other.jwt_sasl_payload_}, jwt_exp_seconds_{other.jwt_exp_seconds_},
+          jwt_iss_{other.jwt_iss_}, jwt_sub_{other.jwt_sub_}, jwt_azp_{other.jwt_azp_},
+          jwt_aud_{other.jwt_aud_}, jwt_preferred_username_{other.jwt_preferred_username_}
     {
     }
 
@@ -194,7 +196,7 @@ class Authenticator
 
    /**
      * Returns a safe JWT summary for logs.
-     * Example: "jwt(exp=1234567890)" or "jwt(no-exp)".
+     * Example: "jwt(exp=1234567890, iss=https://idp/realms/cb, sub=u1)".
      * Does not include the actual token.
      */
     std::string auth_summary() const
@@ -204,11 +206,39 @@ class Authenticator
         }
         std::ostringstream oss;
         if (jwt_exp_seconds_ > 0) {
-            oss << "jwt(exp=" << jwt_exp_seconds_ << ")";
+            oss << "jwt(exp=" << jwt_exp_seconds_;
         } else {
-            oss << "jwt(no-exp)";
+            oss << "jwt(no-exp";
         }
+        /* Claims the server matches on, so a rejection can be traced to
+         * the field that failed to match. */
+        if (!jwt_iss_.empty()) {
+            oss << ", iss=" << jwt_iss_;
+        }
+        if (!jwt_preferred_username_.empty()) {
+            oss << ", preferred_username=" << jwt_preferred_username_;
+        }
+        if (!jwt_sub_.empty()) {
+            oss << ", sub=" << jwt_sub_;
+        }
+        if (!jwt_azp_.empty()) {
+            oss << ", azp=" << jwt_azp_;
+        }
+        if (!jwt_aud_.empty()) {
+            oss << ", aud=" << jwt_aud_;
+        }
+        oss << ")";
         return oss.str();
+    }
+
+    void set_jwt_claims(const std::string &iss, const std::string &sub, const std::string &azp,
+                        const std::string &aud, const std::string &preferred_username)
+    {
+        jwt_iss_ = iss;
+        jwt_sub_ = sub;
+        jwt_azp_ = azp;
+        jwt_aud_ = aud;
+        jwt_preferred_username_ = preferred_username;
     }
 
     /**
@@ -278,6 +308,7 @@ class Authenticator
             secure_zero_string(jwt_sasl_payload_);
 
             jwt_exp_seconds_ = 0;
+            set_jwt_claims("", "", "", "", "");
         }
         mode_ = mode;
         return LCB_SUCCESS;
@@ -315,6 +346,13 @@ class Authenticator
     std::string jwt_bearer_header_{}; /* Authorization header: "Bearer <jwt>" */
     std::string jwt_sasl_payload_{};  /* SASL auth message using the JWT */
     int64_t jwt_exp_seconds_{0};       /* token expiry time in seconds, 0 if not set */
+
+    /* Non-secret identity claims, for diagnostics only. */
+    std::string jwt_iss_{};
+    std::string jwt_sub_{};
+    std::string jwt_azp_{};
+    std::string jwt_aud_{};
+    std::string jwt_preferred_username_{};
 };
 } // namespace lcb
 #endif

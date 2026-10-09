@@ -556,12 +556,16 @@ HANDLER(console_fp_handler)
         *(FILE **)arg = logger->fp;
     } else if (mode == LCB_CNTL_SET) {
         logger->fp = *(FILE **)arg;
+        free(logger->path);
+        logger->path = nullptr;
     } else if (mode == CNTL__MODE_SETSTRING) {
         FILE *fp = fopen(reinterpret_cast<const char *>(arg), "w");
         if (!fp) {
             return LCB_ERR_INVALID_ARGUMENT;
         } else {
             logger->fp = fp;
+            free(logger->path);
+            logger->path = lcb_strdup(reinterpret_cast<const char *>(arg));
         }
     }
     (void)cmd;

@@ -49,6 +49,41 @@ static bool decode_jwt_component(const std::string &part, std::string &out)
     return true;
 }
 
+/** Max stored length of a claim value; these end up in log lines. */
+#define LCB_JWT_CLAIM_MAX_LEN 256
+
+/**
+ * Append @p value to @p out, capped and with control characters replaced.
+ * Claims originate from the IdP and are logged, so unfiltered newlines or
+ * escape sequences would let a token forge log lines.
+ */
+static void append_sanitized_claim(const char *value, std::string &out)
+{
+    for (const char *p = value; *p != '\0' && out.size() < LCB_JWT_CLAIM_MAX_LEN; ++p) {
+        unsigned char c = static_cast<unsigned char>(*p);
+        out.push_back((c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '?');
+    }
+}
+
+/** Read a string claim from @p obj, or leave @p out empty when absent/non-string. */
+static void read_string_claim(cJSON *obj, const char *name, std::string &out)
+{
+    out.clear();
+    cJSON *item = cJSON_GetObjectItem(obj, name);
+    if (item != nullptr && item->type == cJSON_String && item->valuestring != nullptr) {
+        append_sanitized_claim(item->valuestring, out);
+    }
+}
+
+/** Non-secret identity claims from a JWT payload, for diagnostics. */
+struct jwt_claims {
+    std::string iss;
+    std::string sub;
+    std::string azp;
+    std::string aud;
+    std::string preferred_username;
+};
+
 /**
  * Structurally validate @p token and extract the `exp` claim.
  *
@@ -56,15 +91,17 @@ static bool decode_jwt_component(const std::string &part, std::string &out)
  *  2. Base64URL-decode all three parts; reject any malformed segment.
  *  3. Parse header and payload as JSON objects; reject non-objects.
  *  4. Read the numeric `exp` claim from the payload (0 if absent).
+ *  5. Optionally capture the identity claims into @p claims_out.
  *
  * The signature (third component) is validated as well-formed Base64URL but
  * is not verified, that is a server-side concern.
  *
- * @param token    The encoded JWT string.
- * @param exp_out  Populated with the `exp` epoch value, or 0 if absent.
+ * @param token       The encoded JWT string.
+ * @param exp_out     Populated with the `exp` epoch value, or 0 if absent.
+ * @param claims_out  If non-null, populated with the identity claims.
  * @return LCB_SUCCESS on success; LCB_ERR_INVALID_ARGUMENT on any error.
  */
-static lcb_STATUS parse_jwt(const std::string &token, int64_t &exp_out)
+static lcb_STATUS parse_jwt(const std::string &token, int64_t &exp_out, jwt_claims *claims_out = nullptr)
 {
     exp_out = 0;
 
@@ -110,6 +147,32 @@ static lcb_STATUS parse_jwt(const std::string &token, int64_t &exp_out)
     if (exp_item != nullptr && exp_item->type == cJSON_Number) {
         exp_out = static_cast<int64_t>(exp_item->valuedouble);
     }
+
+    /* Step 5 */
+    if (claims_out != nullptr) {
+        read_string_claim(payload, "iss", claims_out->iss);
+        read_string_claim(payload, "sub", claims_out->sub);
+        read_string_claim(payload, "azp", claims_out->azp);
+        read_string_claim(payload, "preferred_username", claims_out->preferred_username);
+        /* "aud" may be a single string or an array of strings (RFC 7519). */
+        claims_out->aud.clear();
+        cJSON *aud_item = cJSON_GetObjectItem(payload, "aud");
+        if (aud_item != nullptr) {
+            if (aud_item->type == cJSON_String && aud_item->valuestring != nullptr) {
+                append_sanitized_claim(aud_item->valuestring, claims_out->aud);
+            } else if (aud_item->type == cJSON_Array) {
+                for (cJSON *e = aud_item->child; e != nullptr; e = e->next) {
+                    if (e->type == cJSON_String && e->valuestring != nullptr) {
+                        if (!claims_out->aud.empty()) {
+                            claims_out->aud += "|";
+                        }
+                        append_sanitized_claim(e->valuestring, claims_out->aud);
+                    }
+                }
+            }
+        }
+    }
+
     cJSON_Delete(payload);
 
     return LCB_SUCCESS;
@@ -148,12 +211,14 @@ lcb_STATUS Authenticator::set_jwt(const std::string &token)
     }
 
     int64_t exp;
-    lcb_STATUS rc = parse_jwt(token, exp);
+    jwt_claims claims;
+    lcb_STATUS rc = parse_jwt(token, exp, &claims);
     if (rc != LCB_SUCCESS) {
         return rc;
     }
 
     store_jwt(token, exp, jwt_, jwt_bearer_header_, jwt_sasl_payload_, jwt_exp_seconds_);
+    set_jwt_claims(claims.iss, claims.sub, claims.azp, claims.aud, claims.preferred_username);
     mode_ = LCBAUTH_MODE_JWT;
     return LCB_SUCCESS;
 }

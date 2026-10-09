@@ -99,9 +99,9 @@ TEST_F(JwtAuthTest, JwtParseValid)
     EXPECT_EQ(LCB_SUCCESS, rc);
     EXPECT_EQ(LCBAUTH_MODE_JWT, auth->mode());
 
-    /* Verify exp was extracted */
+    /* Verify exp and the sub claim were extracted */
     std::string summary = auth->auth_summary();
-    std::string expected_exp = "jwt(exp=" + std::to_string(VALID_JWT_EXP) + ")";
+    std::string expected_exp = "jwt(exp=" + std::to_string(VALID_JWT_EXP) + ", sub=test-user)";
     EXPECT_EQ(expected_exp, summary);
 
     lcbauth_unref(auth);
@@ -113,7 +113,7 @@ TEST_F(JwtAuthTest, JwtParseValidNoExp)
     lcb_AUTHENTICATOR *auth = lcbauth_new();
     lcb_STATUS rc = lcbauth_set_jwt(auth, MINIMAL_JWT, strlen(MINIMAL_JWT));
     EXPECT_EQ(LCB_SUCCESS, rc);
-    EXPECT_EQ("jwt(no-exp)", auth->auth_summary());
+    EXPECT_EQ("jwt(no-exp, sub=minimal)", auth->auth_summary());
     lcbauth_unref(auth);
 }
 
@@ -496,6 +496,120 @@ TEST_F(JwtAuthTest, Phase2_RbacCredentialsForAfterJwtRoundTrip)
 
     /* Bearer header must be cleared */
     EXPECT_TRUE(auth->jwt_bearer_header().empty());
+
+    lcbauth_unref(auth);
+}
+
+/* ---------------------------------------------------------------------------
+ * Identity claims reported by auth_summary()
+ * ------------------------------------------------------------------------ */
+
+/* payload={iss,sub,azp,aud,preferred_username,exp} */
+static const char CLAIMS_ALL_JWT[] =
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9"
+    ".eyJpc3MiOiJodHRwczovL2lkcC9yZWFsbXMvY2IiLCJzdWIiOiJzMSIsImF6cCI6ImNsaWVudDEiLCJhdWQiOiJhY2N0IiwicHJlZmVycmVkX3VzZXJuYW1lIjoidTEiLCJleHAiOjk5OTk5OTk5OTl9"
+    ".sig";
+
+/* payload={exp} only: no identity claims */
+static const char CLAIMS_NONE_JWT[] =
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9"
+    ".eyJleHAiOjk5OTk5OTk5OTl9"
+    ".sig";
+
+/* payload={aud:["a1","a2"],exp} */
+static const char CLAIMS_AUD_ARRAY_JWT[] =
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9"
+    ".eyJhdWQiOlsiYTEiLCJhMiJdLCJleHAiOjk5OTk5OTk5OTl9"
+    ".sig";
+
+/* payload={sub:"bad\nline",exp}: escaped newline must not reach the log */
+static const char CLAIMS_CTRL_CHAR_JWT[] =
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9"
+    ".eyJzdWIiOiJiYWRcbmxpbmUiLCJleHAiOjk5OTk5OTk5OTl9"
+    ".sig";
+
+TEST_F(JwtAuthTest, ClaimsAllPresentInSummary)
+{
+    lcb_AUTHENTICATOR *auth = lcbauth_new();
+    ASSERT_EQ(LCB_SUCCESS, lcbauth_set_jwt(auth, CLAIMS_ALL_JWT, strlen(CLAIMS_ALL_JWT)));
+
+    EXPECT_EQ("jwt(exp=9999999999, iss=https://idp/realms/cb, preferred_username=u1, "
+              "sub=s1, azp=client1, aud=acct)",
+              auth->auth_summary());
+
+    lcbauth_unref(auth);
+}
+
+TEST_F(JwtAuthTest, ClaimsAbsentOmittedFromSummary)
+{
+    lcb_AUTHENTICATOR *auth = lcbauth_new();
+    ASSERT_EQ(LCB_SUCCESS, lcbauth_set_jwt(auth, CLAIMS_NONE_JWT, strlen(CLAIMS_NONE_JWT)));
+
+    EXPECT_EQ("jwt(exp=9999999999)", auth->auth_summary());
+
+    lcbauth_unref(auth);
+}
+
+TEST_F(JwtAuthTest, ClaimsAudienceArrayIsJoined)
+{
+    lcb_AUTHENTICATOR *auth = lcbauth_new();
+    ASSERT_EQ(LCB_SUCCESS, lcbauth_set_jwt(auth, CLAIMS_AUD_ARRAY_JWT, strlen(CLAIMS_AUD_ARRAY_JWT)));
+
+    EXPECT_EQ("jwt(exp=9999999999, aud=a1|a2)", auth->auth_summary());
+
+    lcbauth_unref(auth);
+}
+
+TEST_F(JwtAuthTest, ClaimsControlCharactersAreSanitized)
+{
+    lcb_AUTHENTICATOR *auth = lcbauth_new();
+    ASSERT_EQ(LCB_SUCCESS, lcbauth_set_jwt(auth, CLAIMS_CTRL_CHAR_JWT, strlen(CLAIMS_CTRL_CHAR_JWT)));
+
+    std::string summary = auth->auth_summary();
+    EXPECT_EQ(std::string::npos, summary.find('\n'));
+    EXPECT_NE(std::string::npos, summary.find("sub=bad?line"));
+
+    lcbauth_unref(auth);
+}
+
+TEST_F(JwtAuthTest, ClaimsNeverExposeTokenOrSignature)
+{
+    lcb_AUTHENTICATOR *auth = lcbauth_new();
+    ASSERT_EQ(LCB_SUCCESS, lcbauth_set_jwt(auth, CLAIMS_ALL_JWT, strlen(CLAIMS_ALL_JWT)));
+
+    std::string summary = auth->auth_summary();
+    EXPECT_EQ(std::string::npos, summary.find(CLAIMS_ALL_JWT));
+    EXPECT_EQ(std::string::npos, summary.find("sig"));
+
+    lcbauth_unref(auth);
+}
+
+TEST_F(JwtAuthTest, ClaimsSurviveCopy)
+{
+    lcb_AUTHENTICATOR *auth = lcbauth_new();
+    ASSERT_EQ(LCB_SUCCESS, lcbauth_set_jwt(auth, CLAIMS_ALL_JWT, strlen(CLAIMS_ALL_JWT)));
+
+    lcb_AUTHENTICATOR *copy = new lcb::Authenticator(*auth);
+    EXPECT_EQ(auth->auth_summary(), copy->auth_summary());
+
+    lcbauth_unref(copy);
+    lcbauth_unref(auth);
+}
+
+TEST_F(JwtAuthTest, ClaimsClearedWhenLeavingJwtMode)
+{
+    lcb_AUTHENTICATOR *auth = lcbauth_new();
+    ASSERT_EQ(LCB_SUCCESS, lcbauth_set_jwt(auth, CLAIMS_ALL_JWT, strlen(CLAIMS_ALL_JWT)));
+    ASSERT_NE("", auth->auth_summary());
+
+    ASSERT_EQ(LCB_SUCCESS, lcbauth_set_mode(auth, LCBAUTH_MODE_RBAC));
+    EXPECT_EQ("", auth->auth_summary());
+    EXPECT_TRUE(auth->jwt_bearer_header().empty());
+    EXPECT_TRUE(auth->jwt_sasl_payload().empty());
+
+    /* Returning to JWT mode must not resurrect the old claims */
+    ASSERT_EQ(LCB_SUCCESS, lcbauth_set_jwt(auth, CLAIMS_NONE_JWT, strlen(CLAIMS_NONE_JWT)));
+    EXPECT_EQ("jwt(exp=9999999999)", auth->auth_summary());
 
     lcbauth_unref(auth);
 }

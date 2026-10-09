@@ -22,6 +22,7 @@
 #include <stdarg.h>
 
 #ifdef _WIN32
+#include <windows.h> /* MoveFileExA */
 #define flockfile(x) (void)0
 #define funlockfile(x) (void)0
 #endif
@@ -74,6 +75,35 @@ static long ret_thr_self(void)
 #endif
 
 static hrtime_t start_time = 0;
+
+/* Library-opened log files are rotated to <path>.1 at this size. */
+#define LCB_CONSOLE_LOG_MAX_BYTES ((long)(20 * 1024 * 1024))
+
+/**
+ * Move @p path to <path>.1 and reopen @p fp on @p path.
+ * Returns 0 if rotated, 1 if the rename failed (nothing lost, still appending), -1 if @p fp was lost.
+ */
+static int rotate_log_file(FILE *fp, const char *path)
+{
+    char backup[PATH_MAX + 2];
+    int rotated;
+    snprintf(backup, sizeof(backup), "%s.1", path);
+#ifdef _WIN32
+    /* Our own handle must be closed to rename. The move fails, leaving .1 intact,
+     * while another handle (e.g. another process) still has the log open. */
+    if (freopen("NUL", "w", fp) == NULL) {
+        return -1;
+    }
+    rotated = MoveFileExA(path, backup, MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+    rotated = rename(path, backup) == 0;
+#endif
+    /* Append, never truncate: other processes may share this file. freopen keeps the same FILE*. */
+    if (freopen(path, "a", fp) == NULL) {
+        return -1;
+    }
+    return rotated ? 0 : 1;
+}
 
 static void console_log(const lcb_LOGGER *procs, uint64_t iid, const char *subsys, lcb_LOG_SEVERITY severity,
                         const char *srcfile, int srcline, const char *fmt, va_list ap);
@@ -131,12 +161,43 @@ static void console_log(const lcb_LOGGER *procs, uint64_t iid, const char *subsy
     fp = vprocs->fp ? vprocs->fp : stderr;
 
     flockfile(fp);
+
+    /* Only rotate files we opened; a caller-owned FILE* is left alone. */
+    if (vprocs->path && ftell(fp) >= LCB_CONSOLE_LOG_MAX_BYTES) {
+        int rc;
+        fflush(fp);
+        rc = rotate_log_file(fp, vprocs->path);
+        if (rc == 0) {
+            fprintf(fp, "=== log rotated: previous output in %s.1 ===\n", vprocs->path);
+        } else if (rc == 1) {
+            fprintf(fp, "=== log not rotated: %s is in use elsewhere; continuing in this file ===\n", vprocs->path);
+            /* Stop retrying on every line; the file is kept as is. */
+            free(vprocs->path);
+            vprocs->path = NULL;
+        } else {
+            /* fp is closed after a failed freopen; fall back to stderr. */
+            funlockfile(fp);
+            free(vprocs->path);
+            vprocs->path = NULL;
+            vprocs->fp = NULL;
+            fp = stderr;
+            flockfile(fp);
+        }
+    }
+
     fprintf(fp, "%lums ", (unsigned long)(now - start_time) / 1000000);
 
     fprintf(fp, "[I%" PRIx64 "] {%" THREAD_ID_FMT "} [%s] (%s - L:%d) ", iid, GET_THREAD_ID(),
             level_to_string(severity), subsys, srcline);
     vfprintf(fp, fmt, ap);
     fprintf(fp, "\n");
+
+    /* Flush per line so a crash cannot truncate the log at the point of
+     * failure. Only needed for files; stderr is already unbuffered. */
+    if (vprocs->fp) {
+        fflush(fp);
+    }
+
     funlockfile(fp);
 
     (void)procs;
@@ -196,6 +257,9 @@ lcb_LOGGER *lcb_init_console_logger(void)
                     strerror(errno));
         }
         console_logprocs.fp = fp;
+        if (fp) {
+            console_logprocs.path = lcb_strdup(namebuf);
+        }
     }
 
     if (!lcb_getenv_nonempty("LCB_LOGLEVEL", vbuf, sizeof(vbuf))) {

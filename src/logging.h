@@ -51,6 +51,7 @@ struct lcb_CONSOLELOGGER {
     struct lcb_LOGGER_ base;
     FILE *fp;
     int minlevel;
+    char *path; /* non-NULL only if the library opened fp; enables rotation */
 };
 
 /**
