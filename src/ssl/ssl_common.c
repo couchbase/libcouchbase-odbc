@@ -246,11 +246,9 @@ int iotssl_maybe_error(lcbio_XSSL *xs, int rv)
  ** Higher Level SSL_CTX Wrappers                                            **
  ******************************************************************************
  ******************************************************************************/
-/**
- * Logs why peer verification failed, including the offending certificate.
- * Purely diagnostic: @p preverify_ok is returned unchanged, so the trust
- * decision is exactly what OpenSSL already made.
- */
+static int cert_is_disallowed(const struct lcbio_SSLCTX *sctx, X509 *cert);
+
+/** Rejects disallowed certificates and logs verification failures; otherwise keeps OpenSSL's decision. */
 static int verify_callback(int preverify_ok, X509_STORE_CTX *store_ctx)
 {
     SSL *ssl;
@@ -260,14 +258,20 @@ static int verify_callback(int preverify_ok, X509_STORE_CTX *store_ctx)
     char subject[256] = {0};
     char issuer[256] = {0};
 
-    if (preverify_ok) {
-        return preverify_ok;
-    }
-
     ssl = X509_STORE_CTX_get_ex_data(store_ctx, SSL_get_ex_data_X509_STORE_CTX_idx());
     if (ssl == NULL) {
         return preverify_ok;
     }
+    if (preverify_ok) {
+        if (!cert_is_disallowed(SSL_CTX_get_app_data(SSL_get_SSL_CTX(ssl)),
+                                X509_STORE_CTX_get_current_cert(store_ctx))) {
+            return preverify_ok;
+        }
+        /* Disallowed wins over trust */
+        X509_STORE_CTX_set_error(store_ctx, X509_V_ERR_CERT_REJECTED);
+        preverify_ok = 0;
+    }
+
     sock = SSL_get_app_data(ssl);
     if (sock == NULL) {
         return preverify_ok;
@@ -349,7 +353,22 @@ msg_callback(int write_p, int version, int ctype, const void *buf, size_t n,
 
 struct lcbio_SSLCTX {
     SSL_CTX *ctx;
+    STACK_OF(X509) * disallowed; /* Windows Disallowed store */
 };
+
+static int cert_is_disallowed(const struct lcbio_SSLCTX *sctx, X509 *cert)
+{
+    int i;
+    if (sctx == NULL || sctx->disallowed == NULL || cert == NULL) {
+        return 0;
+    }
+    for (i = 0; i < sk_X509_num(sctx->disallowed); i++) {
+        if (X509_cmp(sk_X509_value(sctx->disallowed, i), cert) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
 
 #define LOGARGS_S(settings, lvl) settings, "SSL", lvl, __FILE__, __LINE__
 
@@ -437,18 +456,27 @@ static int keyfile_password_cb(char *buf, int size, int rwflag, void *userdata)
     return secret->password_len;
 }
 
-int lcbio_ssl_add_der_cert(lcbio_pSSLCTX sctx, const unsigned char *der, long len)
+static X509 *decode_der_cert(lcbio_pSSLCTX sctx, const unsigned char *der, long len)
 {
     X509 *x509;
-    int added;
 
     if (sctx == NULL || sctx->ctx == NULL || der == NULL || len <= 0) {
-        return 0;
+        return NULL;
     }
     x509 = d2i_X509(NULL, &der, len);
     if (x509 == NULL) {
         /* Don't leave the decode error for a later ERR_get_error() caller */
         ERR_clear_error();
+    }
+    return x509;
+}
+
+int lcbio_ssl_add_der_cert(lcbio_pSSLCTX sctx, const unsigned char *der, long len)
+{
+    X509 *x509 = decode_der_cert(sctx, der, len);
+    int added;
+
+    if (x509 == NULL) {
         return 0;
     }
     added = X509_STORE_add_cert(SSL_CTX_get_cert_store(sctx->ctx), x509) == 1;
@@ -458,6 +486,27 @@ int lcbio_ssl_add_der_cert(lcbio_pSSLCTX sctx, const unsigned char *der, long le
     }
     X509_free(x509);
     return added;
+}
+
+int lcbio_ssl_add_disallowed_der_cert(lcbio_pSSLCTX sctx, const unsigned char *der, long len)
+{
+    X509 *x509 = decode_der_cert(sctx, der, len);
+
+    if (x509 == NULL) {
+        return 0;
+    }
+    if (cert_is_disallowed(sctx, x509)) {
+        X509_free(x509);
+        return 1;
+    }
+    if (sctx->disallowed == NULL) {
+        sctx->disallowed = sk_X509_new_null();
+    }
+    if (sctx->disallowed == NULL || !sk_X509_push(sctx->disallowed, x509)) {
+        X509_free(x509);
+        return 0;
+    }
+    return 1;
 }
 
 int lcbio_ssl_set_expected_host(X509_VERIFY_PARAM *param, const char *host)
@@ -477,34 +526,79 @@ int lcbio_ssl_set_expected_host(X509_VERIFY_PARAM *param, const char *host)
  * which is normally absent on Windows, so the OS trust store has to be read
  * through CryptoAPI.
  */
-static void add_windows_root_store_certs(const lcb_settings *settings, lcbio_pSSLCTX sctx)
+/* No usage restriction means any use */
+static int windows_allows_server_auth(PCCERT_CONTEXT cert)
 {
-    static const DWORD store_locations[] = {CERT_SYSTEM_STORE_LOCAL_MACHINE, CERT_SYSTEM_STORE_CURRENT_USER};
-    /* ROOT holds the trust anchors; CA holds intermediates. OpenSSL does not
-     * fetch issuers via AIA, so without CA a server that sends only its leaf
-     * cannot be chained to a root that is present. */
-    static const wchar_t *store_names[] = {L"ROOT", L"CA"};
-    int added = 0;
-    size_t i, j;
+    PCERT_ENHKEY_USAGE usage;
+    DWORD size = 0, i;
+    int ok = 0;
 
-    for (i = 0; i < sizeof(store_locations) / sizeof(store_locations[0]); i++) {
-        for (j = 0; j < sizeof(store_names) / sizeof(store_names[0]); j++) {
-            HCERTSTORE hStore = CertOpenStore(CERT_STORE_PROV_SYSTEM, 0, (HCRYPTPROV_LEGACY)NULL,
-                                              store_locations[i] | CERT_STORE_READONLY_FLAG, store_names[j]);
-            PCCERT_CONTEXT cert_ctx = NULL;
-
-            if (!hStore) {
-                continue;
-            }
-
-            while ((cert_ctx = CertEnumCertificatesInStore(hStore, cert_ctx)) != NULL) {
-                added += lcbio_ssl_add_der_cert(sctx, cert_ctx->pbCertEncoded, (long)cert_ctx->cbCertEncoded);
-            }
-            CertCloseStore(hStore, 0);
+    SetLastError(0);
+    if (!CertGetEnhancedKeyUsage(cert, 0, NULL, &size)) {
+        return GetLastError() == CRYPT_E_NOT_FOUND;
+    }
+    usage = malloc(size);
+    if (usage == NULL) {
+        return 0;
+    }
+    SetLastError(0);
+    if (CertGetEnhancedKeyUsage(cert, 0, usage, &size)) {
+        /* Empty with CRYPT_E_NOT_FOUND: all uses; otherwise none */
+        ok = usage->cUsageIdentifier == 0 && GetLastError() == CRYPT_E_NOT_FOUND;
+        for (i = 0; i < usage->cUsageIdentifier && !ok; i++) {
+            ok = strcmp(usage->rgpszUsageIdentifier[i], szOID_PKIX_KP_SERVER_AUTH) == 0;
         }
     }
+    free(usage);
+    return ok;
+}
 
-    lcb_log(LOGARGS_S(settings, LCB_LOG_DEBUG), "Added %d certificate(s) from the Windows trust store", added);
+enum windows_store_kind { WINDOWS_STORE_ROOT, WINDOWS_STORE_CA, WINDOWS_STORE_DISALLOWED };
+
+static void add_windows_store(lcbio_pSSLCTX sctx, const wchar_t *name, enum windows_store_kind kind)
+{
+    static const DWORD store_locations[] = {CERT_SYSTEM_STORE_LOCAL_MACHINE, CERT_SYSTEM_STORE_CURRENT_USER};
+    size_t i;
+
+    for (i = 0; i < sizeof(store_locations) / sizeof(store_locations[0]); i++) {
+        HCERTSTORE hStore = CertOpenStore(CERT_STORE_PROV_SYSTEM, 0, (HCRYPTPROV_LEGACY)NULL,
+                                          store_locations[i] | CERT_STORE_READONLY_FLAG, name);
+        PCCERT_CONTEXT cert_ctx = NULL;
+
+        if (!hStore) {
+            continue;
+        }
+        while ((cert_ctx = CertEnumCertificatesInStore(hStore, cert_ctx)) != NULL) {
+            if (kind == WINDOWS_STORE_DISALLOWED) {
+                lcbio_ssl_add_disallowed_der_cert(sctx, cert_ctx->pbCertEncoded, (long)cert_ctx->cbCertEncoded);
+                continue;
+            }
+            /* Windows never treats the CA store as roots */
+            if (kind == WINDOWS_STORE_CA && CertCompareCertificateName(X509_ASN_ENCODING, &cert_ctx->pCertInfo->Subject,
+                                                                       &cert_ctx->pCertInfo->Issuer)) {
+                continue;
+            }
+            if (!windows_allows_server_auth(cert_ctx)) {
+                continue;
+            }
+            lcbio_ssl_add_der_cert(sctx, cert_ctx->pbCertEncoded, (long)cert_ctx->cbCertEncoded);
+        }
+        CertCloseStore(hStore, 0);
+    }
+}
+
+static void add_windows_root_store_certs(const lcb_settings *settings, lcbio_pSSLCTX sctx)
+{
+    STACK_OF(X509_OBJECT) *objects = X509_STORE_get0_objects(SSL_CTX_get_cert_store(sctx->ctx));
+    int before = sk_X509_OBJECT_num(objects);
+
+    add_windows_store(sctx, L"Disallowed", WINDOWS_STORE_DISALLOWED);
+    /* CA holds intermediates; OpenSSL does not fetch them via AIA */
+    add_windows_store(sctx, L"ROOT", WINDOWS_STORE_ROOT);
+    add_windows_store(sctx, L"CA", WINDOWS_STORE_CA);
+
+    lcb_log(LOGARGS_S(settings, LCB_LOG_DEBUG), "Added %d certificate(s) from the Windows trust store; %d disallowed",
+            sk_X509_OBJECT_num(objects) - before, sctx->disallowed ? sk_X509_num(sctx->disallowed) : 0);
 }
 #endif
 
@@ -544,6 +638,8 @@ lcbio_pSSLCTX lcbio_ssl_new(const char *tsfile, const char *cafile, const char *
         *errp = LCB_ERR_SSL_ERROR;
         goto GT_ERR;
     }
+    /* for verify_callback */
+    SSL_CTX_set_app_data(ret->ctx, ret);
 
     if (SSL_CTX_set_cipher_list(ret->ctx, cipher_list) == 0 && strlen(cipher_list) > 0) {
         /*
@@ -653,6 +749,7 @@ GT_ERR:
         if (ret->ctx) {
             SSL_CTX_free(ret->ctx);
         }
+        sk_X509_pop_free(ret->disallowed, X509_free);
         free(ret);
     }
     return NULL;
@@ -721,6 +818,7 @@ lcb_STATUS lcbio_ssl_get_error(lcbio_SOCKET *sock)
 void lcbio_ssl_free(lcbio_pSSLCTX ctx)
 {
     SSL_CTX_free(ctx->ctx);
+    sk_X509_pop_free(ctx->disallowed, X509_free);
     free(ctx);
 }
 

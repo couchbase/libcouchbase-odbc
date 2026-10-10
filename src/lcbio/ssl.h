@@ -88,6 +88,9 @@ lcbio_pSSLCTX lcbio_ssl_new(const char *tsfile, const char *cafile, const char *
  */
 int lcbio_ssl_add_der_cert(lcbio_pSSLCTX sctx, const unsigned char *der, long len);
 
+/** Add a DER certificate to @p sctx's disallowed list. Returns 1 if on the list, 0 on bad input. */
+int lcbio_ssl_add_disallowed_der_cert(lcbio_pSSLCTX sctx, const unsigned char *der, long len);
+
 /**
  * Require the peer certificate to match @p host: an IP literal must match an
  * IP address SAN, anything else a DNS name.

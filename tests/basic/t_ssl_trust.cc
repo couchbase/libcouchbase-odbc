@@ -106,6 +106,22 @@ TEST_F(SslTrustTest, RejectsInvalidArguments)
     EXPECT_EQ(0, lcbio_ssl_add_der_cert(sctx, TEST_DER_CERT, 0));
 }
 
+TEST_F(SslTrustTest, AddsDisallowedCertificate)
+{
+    EXPECT_EQ(1, lcbio_ssl_add_disallowed_der_cert(sctx, TEST_DER_CERT, sizeof(TEST_DER_CERT)));
+    EXPECT_EQ(1, lcbio_ssl_add_disallowed_der_cert(sctx, TEST_DER_CERT, sizeof(TEST_DER_CERT)));
+    EXPECT_EQ(0UL, ERR_peek_error());
+}
+
+TEST_F(SslTrustTest, RejectsInvalidDisallowed)
+{
+    static const unsigned char garbage[] = {0xde, 0xad, 0xbe, 0xef, 0x00, 0x01};
+    EXPECT_EQ(0, lcbio_ssl_add_disallowed_der_cert(nullptr, TEST_DER_CERT, sizeof(TEST_DER_CERT)));
+    EXPECT_EQ(0, lcbio_ssl_add_disallowed_der_cert(sctx, nullptr, 10));
+    EXPECT_EQ(0, lcbio_ssl_add_disallowed_der_cert(sctx, garbage, sizeof(garbage)));
+    EXPECT_EQ(0UL, ERR_peek_error());
+}
+
 /* Verifies TEST_DER_CERT against itself, optionally requiring @p host. */
 static int verify_test_cert(const char *host)
 {
