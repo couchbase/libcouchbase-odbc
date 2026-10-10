@@ -479,6 +479,11 @@ int lcbio_ssl_add_der_cert(lcbio_pSSLCTX sctx, const unsigned char *der, long le
     if (x509 == NULL) {
         return 0;
     }
+    /* Never trust a disallowed cert: OpenSSL could pick it over a valid same-subject root */
+    if (cert_is_disallowed(sctx, x509)) {
+        X509_free(x509);
+        return 0;
+    }
     added = X509_STORE_add_cert(SSL_CTX_get_cert_store(sctx->ctx), x509) == 1;
     if (!added) {
         /* Before OpenSSL 3.0 a duplicate is reported as an error */

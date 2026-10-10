@@ -113,6 +113,13 @@ TEST_F(SslTrustTest, AddsDisallowedCertificate)
     EXPECT_EQ(0UL, ERR_peek_error());
 }
 
+TEST_F(SslTrustTest, DisallowedIsNotAddedAsTrusted)
+{
+    ASSERT_EQ(1, lcbio_ssl_add_disallowed_der_cert(sctx, TEST_DER_CERT, sizeof(TEST_DER_CERT)));
+    EXPECT_EQ(0, lcbio_ssl_add_der_cert(sctx, TEST_DER_CERT, sizeof(TEST_DER_CERT)));
+    EXPECT_EQ(0UL, ERR_peek_error());
+}
+
 TEST_F(SslTrustTest, RejectsInvalidDisallowed)
 {
     static const unsigned char garbage[] = {0xde, 0xad, 0xbe, 0xef, 0x00, 0x01};
