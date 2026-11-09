@@ -37,6 +37,16 @@ class HandleWrap;
         return;                                                                                                        \
     }
 
+/* An analytics-only deployment serves none: Operational Insights pins
+ * max_buckets_supported to 0, so there is no data service for a KV
+ * operation to reach. Gate any test that touches KV on this before running
+ * it against one -- tools/jenkins/oi-server-tests does. */
+#define SKIP_UNLESS_BUCKETS()                                                                                          \
+    if (!MockEnvironment::getInstance()->hasBuckets()) {                                                               \
+        MockEnvironment::printSkipMessage(__FILE__, __LINE__, "needs a cluster that serves buckets");                  \
+        return;                                                                                                        \
+    }
+
 #define SKIP_UNLESS_SEARCH_INDEX()                                                                                     \
     auto search_index = MockEnvironment::getInstance()->getSearchIndex();                                              \
     if (search_index.empty()) {                                                                                        \

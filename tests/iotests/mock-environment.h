@@ -317,6 +317,17 @@ class MockEnvironment : public ::testing::Environment
     }
 
     /**
+     * Does the backend serve buckets at all? False only for a real cluster
+     * configured with an empty bucket field in LCB_TEST_CLUSTER_CONF, which is
+     * how an analytics-only deployment is described: Operational Insights sets
+     * max_buckets_supported to 0, so there is no data service to bind to.
+     */
+    bool hasBuckets() const
+    {
+        return clusterHasBuckets;
+    }
+
+    /**
      * Simulate node failover. In this case mock will disable server
      * corresponding given index an push new configuration. No data
      * rebalancing implemented on the mock.
@@ -487,6 +498,7 @@ class MockEnvironment : public ::testing::Environment
     ServerParams serverParams;
     int numNodes{4};
     bool realCluster{false};
+    bool clusterHasBuckets{true};
     ServerVersion serverVersion{VERSION_UNKNOWN};
     const char *http{nullptr};
     lcb_io_opt_st *iops{nullptr};

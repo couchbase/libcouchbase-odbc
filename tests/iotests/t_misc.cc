@@ -390,6 +390,9 @@ TEST_F(MockUnitTest, testGetHostInfo)
 
 TEST_F(MockUnitTest, testHttpBootstrap)
 {
+    // storeKey() below needs a data service, which an analytics-only cluster has not.
+    SKIP_UNLESS_BUCKETS();
+
     // Every other mock test takes its config over the memcached protocol, because
     // makeConnectParams() pins bootstrap_on=cccp. Pin HTTP here instead, so the REST
     // streaming provider in bucketconfig/bc_http.cc is exercised as well.

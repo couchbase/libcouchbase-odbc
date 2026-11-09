@@ -491,10 +491,20 @@ void MockEnvironment::bootstrapRealCluster()
 {
     serverParams = ServerParams(mock->http, mock->bucket, mock->username, mock->password);
 
+    /*
+     * An empty bucket field in LCB_TEST_CLUSTER_CONF describes a cluster that
+     * serves no buckets. Operational Insights is one: its config profile sets
+     * max_buckets_supported to 0, so there is no bucket for a bucket-bound
+     * handle to open and no data service to probe. Bootstrap at cluster level
+     * instead, skip the KV stats and the write-readiness probe, and leave the
+     * tests that need KV to SKIP_UNLESS_BUCKETS().
+     */
+    clusterHasBuckets = !serverParams.getBucket().empty();
+
     lcb_INSTANCE *tmphandle;
     lcb_STATUS err;
     lcb_CREATEOPTS *options = nullptr;
-    serverParams.makeConnectParams(options, nullptr);
+    serverParams.makeConnectParams(options, nullptr, clusterHasBuckets ? LCB_TYPE_BUCKET : LCB_TYPE_CLUSTER);
 
     err = lcb_create(&tmphandle, options);
     ASSERT_EQ(LCB_SUCCESS, err) << lcb_strerror_short(err);
@@ -503,15 +513,22 @@ void MockEnvironment::bootstrapRealCluster()
     err = lcb_connect(tmphandle);
     ASSERT_EQ(LCB_SUCCESS, err) << lcb_strerror_short(err);
     lcb_wait(tmphandle, LCB_WAIT_DEFAULT);
-
-    lcb_install_callback(tmphandle, LCB_CALLBACK_STATS, (lcb_RESPCALLBACK)statsCallback);
-    lcb_CMDSTATS *scmd;
-    lcb_cmdstats_create(&scmd);
-    err = lcb_stats(tmphandle, this, scmd);
-    lcb_cmdstats_destroy(scmd);
+    err = lcb_get_bootstrap_status(tmphandle);
     ASSERT_EQ(LCB_SUCCESS, err) << lcb_strerror_short(err);
 
-    lcb_wait(tmphandle, LCB_WAIT_DEFAULT);
+    if (clusterHasBuckets) {
+        /* The server version is read from the KV "version" stat, so a cluster
+         * with no data service leaves it VERSION_UNKNOWN and every
+         * LCB_TEST_REQUIRE_CLUSTER_VERSION gate skips. */
+        lcb_install_callback(tmphandle, LCB_CALLBACK_STATS, (lcb_RESPCALLBACK)statsCallback);
+        lcb_CMDSTATS *scmd;
+        lcb_cmdstats_create(&scmd);
+        err = lcb_stats(tmphandle, this, scmd);
+        lcb_cmdstats_destroy(scmd);
+        ASSERT_EQ(LCB_SUCCESS, err) << lcb_strerror_short(err);
+
+        lcb_wait(tmphandle, LCB_WAIT_DEFAULT);
+    }
 
     const char *const *servers = lcb_get_server_list(tmphandle);
     int ii;
@@ -519,15 +536,19 @@ void MockEnvironment::bootstrapRealCluster()
         // no body
     }
 
-    featureRegistry.insert("observe");
-    featureRegistry.insert("views");
     featureRegistry.insert("http");
-    featureRegistry.insert("replica_read");
-    featureRegistry.insert("lock");
+    if (clusterHasBuckets) {
+        featureRegistry.insert("observe");
+        featureRegistry.insert("views");
+        featureRegistry.insert("replica_read");
+        featureRegistry.insert("lock");
+    }
 
     numNodes = ii;
 
-    waitForWriteReady(tmphandle);
+    if (clusterHasBuckets) {
+        waitForWriteReady(tmphandle);
+    }
 
     lcb_destroy(tmphandle);
 }

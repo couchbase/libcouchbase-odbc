@@ -1,0 +1,520 @@
+#!/usr/bin/env bash
+
+#    Copyright 2026 Couchbase, Inc.
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+
+# Runs the iotests that need a real server against an Operational Insights node
+# in docker. Everything in tests/iotests otherwise drives CouchbaseMock, which
+# fakes the backend, so the analytics path the ODBC driver actually uses has no
+# integration coverage at all without this.
+#
+# Subcommands, meant to be called from separate pipeline steps so that log
+# collection can sit in a post/always block and still run after a failure:
+#
+#   up       start the node, initialise it, configure a JWT issuer
+#   test     build nothing, just run the tests against the node from up
+#   collect  copy the server logs and a cbcollect_info into $OI_LOG_DIR
+#   down     remove the containers and the network
+#
+# "collect" must run before "down", and both should run even when "test" fails.
+
+set -u
+set -o pipefail
+
+say() { printf '\n=== %s ===\n' "$*"; }
+
+die() {
+    echo "$*" >&2
+    exit 1
+}
+
+# Setup steps run under must(), so a failed network create, image pull or
+# container start stops here rather than being noticed later for a stranger
+# reason. "set -e" is not the way to get that in this script: the readiness
+# loops below are written as "probe && break", which errexit reads as a failed
+# command on every attempt that is not yet ready, and the first one would end
+# the run.
+must() { "$@" || die "failed: $*"; }
+
+PROJECT_ROOT="$(cd "$(dirname "$0")/../.." >/dev/null 2>&1 && pwd -P)"
+
+: "${OI_IMAGE:=couchbase/operational-insights:3.0.0}"
+: "${OI_S3_IMAGE:=adobe/s3mock:4.12.4}"
+: "${OI_CURL_IMAGE:=curlimages/curl:8.23.0}"
+: "${OI_BUILD_DIR:=${PROJECT_ROOT}/build}"
+: "${OI_LOG_DIR:=${PROJECT_ROOT}/oi-logs}"
+# The agents are shared, so names have to be unique per job as well as per build:
+# two different jobs both on their build 7 would otherwise collide on the
+# container name and the docker network. Build number plus a hash of the job name
+# keeps that unique and stays short enough to use as a DNS label.
+: "${OI_TAG:=${BUILD_NUMBER:-0}-$(printf '%s' "${JOB_NAME:-local}" | cksum | cut -d' ' -f1)}"
+: "${OI_GTEST_FILTER:=JwtAnalytics*}"
+# TRACE, so the retained log carries lcb's own provider lines -- "Starting HTTP
+# Configuration Provider", "Successfuly connected to REST API" and the config it
+# parsed. Without them a run that bootstrapped from a locally synthesized config
+# looks exactly like one that was served a cluster map.
+: "${LCB_LOGLEVEL:=4}"
+# Run the tests behind a forwarder that carries only the HTTP and analytics
+# ports, so the node's KV ports are unreachable while they run. See oi_proxy_up.
+: "${OI_BLOCK_KV:=1}"
+
+NET="oi-lcb-${OI_TAG}"
+NODE="oi-lcb-${OI_TAG}-node"
+S3="oi-lcb-${OI_TAG}-s3"
+PROXY="oi-lcb-${OI_TAG}-proxy"
+HOSTN="oi1.lcb-${OI_TAG}.test"
+S3_BUCKET=analytics
+ADMIN=Administrator
+PASSWD=password123
+AUTH="${ADMIN}:${PASSWD}"
+MGMT="http://${HOSTN}:8091"
+ENV_FILE="${OI_BUILD_DIR}/oi-env.sh"
+
+# The agent is itself a container holding only the docker socket, so it cannot
+# reach the node's bridge network at all -- and it must not be attached to it
+# (see oi_test). Every REST call therefore goes through a throwaway container on
+# that network.
+# A raw TCP forwarder and a port prober, both run from the node's own image:
+# it is already pulled, and it carries python3 (3.12) but no iptables, socat or
+# nc, so this is the only way to put a port-selective front end on the node
+# without privileges the agent does not have.
+FORWARD_PY='
+import socket, sys, threading
+
+def pipe(a, b):
+    try:
+        while True:
+            d = a.recv(65536)
+            if not d:
+                break
+            b.sendall(d)
+    except OSError:
+        pass
+    finally:
+        for s in (a, b):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+def handle(c, host, port):
+    try:
+        u = socket.create_connection((host, port))
+    except OSError:
+        c.close()
+        return
+    threading.Thread(target=pipe, args=(c, u), daemon=True).start()
+    pipe(u, c)
+
+def listen(port, host):
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("", port))
+    s.listen(64)
+    while True:
+        c, _ = s.accept()
+        threading.Thread(target=handle, args=(c, host, port), daemon=True).start()
+
+host = sys.argv[1]
+for p in sys.argv[2:]:
+    threading.Thread(target=listen, args=(int(p), host), daemon=True).start()
+threading.Event().wait()
+'
+
+PROBE_PY='
+import socket, sys
+host, want_open, want_shut = sys.argv[1], [], []
+for a in sys.argv[2:]:
+    (want_shut if a.startswith("-") else want_open).append(a.lstrip("-"))
+bad = 0
+for p, expect in [(p, True) for p in want_open] + [(p, False) for p in want_shut]:
+    try:
+        socket.create_connection((host, int(p)), timeout=5).close()
+        got = True
+    except OSError:
+        got = False
+    ok = got == expect
+    bad += not ok
+    print("%-6s %-7s expected %s" % (p, "open" if got else "closed",
+                                     "open" if expect else "closed"),
+          "" if ok else "  <-- WRONG")
+sys.exit(1 if bad else 0)
+'
+
+# Ports the forwarder carries: management and analytics, plaintext and TLS. Not
+# 11207/11210, which is the point.
+PROXY_PORTS="8091 18091 8095 18095"
+
+req() { docker run --rm --network "$NET" "$OI_CURL_IMAGE" -s "$@"; }
+reqf() { docker run --rm --network "$NET" "$OI_CURL_IMAGE" -sf "$@"; }
+
+oi_up() {
+    say "Starting ${OI_IMAGE}"
+    must docker network create "$NET" >/dev/null
+    must docker pull -q "$OI_CURL_IMAGE" >/dev/null
+    must docker pull -q "$OI_IMAGE"
+
+    must docker run -d --name "$S3" --network "$NET" -e initialBuckets="$S3_BUCKET" \
+        -e retainFilesOnExit=false "$OI_S3_IMAGE" >/dev/null
+    local i
+    for i in $(seq 1 30); do
+        reqf -m 3 "http://${S3}:9090/" 2>/dev/null | grep -q "$S3_BUCKET" && break
+        sleep 2
+    done
+    # S3Mock serves path-style addressing only. Given a hostname the AWS SDK
+    # switches to virtual-host style (<bucket>.<host>), which it does not serve,
+    # so the endpoint has to be an IP literal.
+    local s3ip
+    s3ip=$(docker inspect "$S3" -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+
+    # The launcher refuses to start under the default 1024 open-file limit.
+    must docker run -d --name "$NODE" --hostname "$HOSTN" --network "$NET" \
+        --network-alias "$HOSTN" --ulimit nofile=200000:200000 "$OI_IMAGE" >/dev/null
+
+    local served=0
+    for i in $(seq 1 72); do
+        if reqf -m 5 "${MGMT}/pools" >/dev/null 2>&1; then served=1; break; fi
+        sleep 5
+    done
+    if [ "$served" != 1 ]; then
+        echo "node never served REST" >&2
+        docker logs --tail 80 "$NODE" >&2 2>&1
+        return 1
+    fi
+
+    say "Initialising the cluster"
+    # Operational Insights will not initialise without blob storage.
+    req -m 60 -X POST "${MGMT}/settings/analytics" \
+        -d blobStorageScheme=s3 -d blobStorageBucket="$S3_BUCKET" \
+        -d blobStoragePrefix="lcb-${OI_TAG}" -d blobStorageRegion=us-east-1 \
+        -d blobStorageEndpoint="http://${s3ip}:9090" \
+        -d blobStorageAnonymousAuth=true | grep -q blobStorageScheme || {
+        echo "could not configure blob storage" >&2
+        return 1
+    }
+    must reqf -m 30 -X POST "${MGMT}/node/controller/rename" -d hostname="$HOSTN" >/dev/null
+    # memoryQuota must be 100: the profile pins kv min_quota and max_quota there.
+    req -m 180 -X POST "${MGMT}/clusterInit" -d username="$ADMIN" -d password="$PASSWD" \
+        -d port=SAME -d services=kv,cbas -d clusterName="lcb-${OI_TAG}" \
+        -d memoryQuota=100 -d cbasMemoryQuota=1024 | grep -q newBaseUri || {
+        echo "clusterInit failed" >&2
+        return 1
+    }
+
+    # clusterInit returns before the analytics service has bound its ports, and a
+    # test that starts in that window gets LCB_ERR_CONNECTION_REFUSED from the
+    # query endpoint rather than anything to do with the token. Wait for the
+    # service itself to answer a statement, not just for the node to be up.
+    say "Waiting for the analytics service"
+    local ready=0
+    for i in $(seq 1 60); do
+        if docker run --rm --network "$NET" "$OI_CURL_IMAGE" -sf -u "$AUTH" -m 10 \
+            -H 'Content-Type: application/json' -X POST "http://${HOSTN}:8095/query/service" \
+            -d '{"statement":"SELECT 1"}' >/dev/null 2>&1; then
+            ready=1
+            echo "analytics answered after $((i * 5))s"
+            break
+        fi
+        sleep 5
+    done
+    if [ "$ready" != 1 ]; then
+        echo "the analytics service never answered a statement" >&2
+        docker logs --tail 60 "$NODE" >&2 2>&1
+        return 1
+    fi
+    # The TLS port is what the JWT tests use, and it binds separately.
+    ready=0
+    for i in $(seq 1 30); do
+        if docker run --rm --network "$NET" "$OI_CURL_IMAGE" -sfk -u "$AUTH" -m 10 \
+            -H 'Content-Type: application/json' -X POST "https://${HOSTN}:18095/query/service" \
+            -d '{"statement":"SELECT 1"}' >/dev/null 2>&1; then
+            ready=1
+            echo "analytics TLS answered after $((i * 5))s"
+            break
+        fi
+        sleep 5
+    done
+    [ "$ready" = 1 ] || { echo "the analytics TLS port never answered" >&2; return 1; }
+
+    say "Configuring a JWT issuer"
+    local secret issuer audience group
+    secret=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+    issuer="lcb-odbc-${OI_TAG}"
+    audience="lcb-odbc-tests"
+    group=lcb_jwt_analytics
+    # jitProvisioning maps the token's groups claim onto this group, so it has to
+    # exist before the first token is presented.
+    must reqf -u "$AUTH" -m 20 -X PUT "${MGMT}/settings/rbac/groups/${group}" \
+        -d roles=analytics_admin -d description="libcouchbase JWT tests" >/dev/null
+    mkdir -p "$OI_BUILD_DIR"
+    # Piped in on stdin rather than bind-mounted: the agent's workspace belongs to
+    # another uid than the one inside the curl image, so a mount there is readable
+    # but not writable, and keeping both directions on stdio avoids the asymmetry.
+    printf '%s' '{"enabled": true,
+ "issuers": [{"name": "'"${issuer}"'",
+              "signingAlgorithm": "HS256",
+              "sharedSecret": "'"${secret}"'",
+              "audClaim": "aud",
+              "audienceHandling": "any",
+              "audiences": ["'"${audience}"'"],
+              "subClaim": "sub",
+              "groupsClaim": "groups",
+              "jitProvisioning": true}]}' |
+        docker run --rm -i --network "$NET" "$OI_CURL_IMAGE" \
+            -sf -u "$AUTH" -m 30 -X PUT "${MGMT}/settings/jwt" \
+            -H 'Content-Type: application/json' -d @- >/dev/null || {
+        echo "PUT /settings/jwt failed" >&2
+        return 1
+    }
+    # OAUTHBEARER is gated separately and only affects the KV/memcached path.
+    must reqf -u "$AUTH" -m 20 -X POST "${MGMT}/settings/security" \
+        -d oauthBearerEnabled=true >/dev/null
+
+    # Written by the agent's own shell from the sidecar's stdout, for the same
+    # reason: the curl image's uid cannot write into the workspace.
+    docker run --rm --network "$NET" "$OI_CURL_IMAGE" \
+        -sf -u "$AUTH" -m 20 "${MGMT}/pools/default/certificate" >"${OI_BUILD_DIR}/oi-ca.pem" || {
+        echo "could not fetch the cluster CA certificate" >&2
+        return 1
+    }
+    head -1 "${OI_BUILD_DIR}/oi-ca.pem" | grep -q 'BEGIN CERTIFICATE' || {
+        echo "the cluster CA certificate does not look like a PEM:" >&2
+        head -3 "${OI_BUILD_DIR}/oi-ca.pem" >&2
+        return 1
+    }
+
+    # An empty bucket field says "this cluster serves no buckets", which is what
+    # Operational Insights is: its profile sets max_buckets_supported to 0.
+    #
+    # The host carries :8091 because ServerParams::makeConnectParams() renders a
+    # host with no port as "couchbase://<host>=http", and connspec only reads
+    # "=proto" as a port type when a port is present (host:port=proto) -- given a
+    # bare name it takes the whole string, "=http" included, as the hostname and
+    # the bootstrap fails to resolve. CouchbaseMock always supplies host:port, so
+    # this only shows up against a real cluster.
+    #
+    # The JWT tests get the bare hostname separately: they build their own
+    # couchbases:// string, where a port with no "=proto" would be read as a KV
+    # TLS endpoint rather than a management one.
+    cat >"$ENV_FILE" <<ENV
+export LCB_TEST_CLUSTER_CONF='${HOSTN}:8091,,${ADMIN},${PASSWD}'
+export LCB_TEST_JWT_HOST='${HOSTN}'
+export LCB_TEST_JWT_ISSUER='${issuer}'
+export LCB_TEST_JWT_AUDIENCE='${audience}'
+export LCB_TEST_JWT_SECRET='${secret}'
+export LCB_TEST_JWT_GROUPS='${group}'
+export LCB_TEST_CLUSTER_CACERT='${OI_BUILD_DIR}/oi-ca.pem'
+ENV
+    oi_proxy_up
+    echo "wrote $ENV_FILE"
+    req -u "$AUTH" -m 20 "${MGMT}/pools" | head -c 400
+    echo
+}
+
+# Nothing on a docker bridge network is firewalled: every port the node listens
+# on is reachable from every container on it, and the image has no iptables to
+# change that. So to take the KV ports away from the tests, the node name is
+# pointed at a forwarder that listens on the HTTP and analytics ports only --
+# oi_test adds --add-host, which beats docker's DNS. The cluster map advertises
+# the same name, so the config stream, the analytics requests and any attempt at
+# KV all resolve there, and only the first two find a listener.
+#
+# Consequence worth knowing when reading the logs: http_access.log then records
+# the forwarder's address as the peer, not the test container's. The user agent
+# and the authenticated user still identify the client.
+oi_proxy_up() {
+    [ "$OI_BLOCK_KV" = 1 ] || { echo "OI_BLOCK_KV=0; tests reach the node directly"; return 0; }
+    say "Starting the port forwarder (${PROXY_PORTS})"
+    # shellcheck disable=SC2086
+    docker run -d --name "$PROXY" --network "$NET" --entrypoint python3 "$OI_IMAGE" \
+        -c "$FORWARD_PY" "$HOSTN" $PROXY_PORTS >/dev/null
+    local ip
+    ip=$(docker inspect "$PROXY" -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+    if [ -z "$ip" ]; then
+        echo "forwarder has no address on ${NET}" >&2
+        docker logs --tail 40 "$PROXY" >&2 2>&1
+        return 1
+    fi
+    echo "export OI_PROXY_IP='${ip}'" >>"$ENV_FILE"
+    echo "forwarder at ${ip}"
+}
+
+# A green test run has to mean the KV ports really were out of reach, so check
+# it rather than trusting that the forwarder came up with the right listeners.
+oi_proxy_verify() {
+    say "Checking what the tests can reach"
+    # shellcheck disable=SC2086
+    docker run --rm --network "$NET" --add-host "${HOSTN}:${OI_PROXY_IP}" \
+        --entrypoint python3 "$OI_IMAGE" -c "$PROBE_PY" "$HOSTN" \
+        8091 18091 18095 -11210 -11207 -11206
+}
+
+oi_test() {
+    [ -f "$ENV_FILE" ] || { echo "no ${ENV_FILE}; run 'up' first" >&2; return 1; }
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+
+    # The agent is itself a container, and attaching it to the node's network
+    # with "docker network connect <net> $(hostname)" breaks its own networking:
+    # the JNLP channel to the controller drops mid-build and the build is lost,
+    # sometimes wedged beyond Jenkins' stop/term/kill. So the test binary runs in
+    # a throwaway container joined to that network instead.
+    #
+    # That container runs the agent's own image, so the binary it built is ABI
+    # compatible and the libraries it needs are present, and it runs as the
+    # agent's uid with the workspace mounted at the same path, so the CA
+    # certificate path from the env file resolves and the gtest XML lands back in
+    # the workspace.
+    local image
+    image=${OI_TEST_IMAGE:-$(docker inspect "$(hostname)" --format '{{.Config.Image}}' 2>/dev/null)}
+    if [ -z "$image" ]; then
+        echo "cannot determine the agent's image; set OI_TEST_IMAGE" >&2
+        return 1
+    fi
+    local root=${WORKSPACE:-$PWD}
+
+    local hostmap=""
+    if [ "$OI_BLOCK_KV" = 1 ]; then
+        [ -n "${OI_PROXY_IP:-}" ] || { echo "no OI_PROXY_IP in ${ENV_FILE}" >&2; return 1; }
+        oi_proxy_verify || { echo "the KV ports were not blocked; not running" >&2; return 1; }
+        hostmap="--add-host=${HOSTN}:${OI_PROXY_IP}"
+    fi
+
+    mkdir -p "$OI_LOG_DIR"
+
+    # --entrypoint, because the agent image's own entrypoint would otherwise
+    # swallow the binary as an argument. LCB_LOGFILE keeps the client trace out
+    # of the gtest output and in a file that is archived with the server's.
+    # A report left behind by an earlier run would otherwise answer for this one.
+    local xml="${OI_BUILD_DIR}/oi-server-tests.xml"
+    rm -f "$xml"
+
+    say "Running ${OI_GTEST_FILTER} against ${LCB_TEST_JWT_HOST} (in ${image})"
+    local status=0
+    docker run --rm --network "$NET" --user "$(id -u):$(id -g)" ${hostmap} \
+        -v "${root}:${root}" -w "${root}" \
+        --entrypoint "${OI_BUILD_DIR}/bin/unit-tests" \
+        -e LCB_TEST_CLUSTER_CONF -e LCB_TEST_JWT_HOST -e LCB_TEST_JWT_ISSUER \
+        -e LCB_TEST_JWT_AUDIENCE -e LCB_TEST_JWT_SECRET -e LCB_TEST_JWT_GROUPS \
+        -e LCB_TEST_CLUSTER_CACERT -e "LCB_LOGLEVEL=${LCB_LOGLEVEL}" \
+        -e "LCB_LOGFILE=${OI_LOG_DIR}/lcb-client.log" \
+        "$image" \
+        --gtest_filter="$OI_GTEST_FILTER" --gtest_color=no \
+            --gtest_output="xml:${xml}" || status=$?
+
+    # gtest 1.8.1 exits 0 when --gtest_filter matches nothing, so the exit code
+    # on its own cannot tell a run that passed from one that ran no test at all:
+    # a typo in OI_GTEST_FILTER would leave this stage green while reporting
+    # nothing. Read the count out of the report the junit step publishes.
+    local ran
+    ran=$(sed -n 's/.*<testsuites[^>]*tests="\([0-9][0-9]*\)".*/\1/p' "$xml" 2>/dev/null | head -1)
+    if [ -z "$ran" ]; then
+        echo "no test count in ${xml}: the run left no report" >&2
+        return 1
+    fi
+    echo "${OI_GTEST_FILTER} ran ${ran} test(s)"
+    if [ "$ran" = 0 ]; then
+        echo "no test matched ${OI_GTEST_FILTER}" >&2
+        return 1
+    fi
+
+    return "$status"
+}
+
+# ns_server buffers http_access.log and flushes it on a timer, so copying it
+# straight after the tests can catch it short of the client's own entries -- it
+# did on probe3 #6, whose copy ends at the last setup call and shows no client
+# request at all, which reads exactly like a client that never made one. Wait
+# for the client's user agent to land before copying.
+oi_await_access_log() {
+    local log i
+    log=$(docker exec "$NODE" sh -c 'ls /opt/*/var/lib/couchbase/logs/http_access.log' 2>/dev/null) || return 0
+    for i in $(seq 1 15); do
+        if docker exec "$NODE" grep -q libcouchbase "$log" 2>/dev/null; then
+            echo "client requests flushed to http_access.log after ${i}s"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "no libcouchbase entry in http_access.log after 15s" >&2
+}
+
+oi_collect() {
+    say "Collecting server logs"
+    mkdir -p "$OI_LOG_DIR"
+    docker logs "$NODE" >"${OI_LOG_DIR}/docker-${NODE}.log" 2>&1 || true
+    docker logs "$S3" >"${OI_LOG_DIR}/docker-${S3}.log" 2>&1 || true
+    docker logs "$PROXY" >"${OI_LOG_DIR}/docker-${PROXY}.log" 2>&1 || true
+    oi_await_access_log
+    # 3.0.0 installs under /opt/couchbase; the prefix migration that
+    # oi-option4-validation covers would move this to /opt/enterprise-analytics.
+    local prefix
+    for prefix in /opt/couchbase /opt/enterprise-analytics /opt/operational-insights; do
+        if docker exec "$NODE" test -d "${prefix}/var/lib/couchbase/logs" 2>/dev/null; then
+            docker cp "${NODE}:${prefix}/var/lib/couchbase/logs" "${OI_LOG_DIR}/server-logs" \
+                 2>/dev/null && echo "copied ${prefix}/var/lib/couchbase/logs"
+            break
+        fi
+    done
+    if docker exec "$NODE" sh -c 'ls /opt/*/bin/cbcollect_info' >/dev/null 2>&1; then
+        docker exec "$NODE" sh -c \
+            '/opt/*/bin/cbcollect_info /tmp/cbcollect.zip >/tmp/cbcollect.out 2>&1' || true
+        docker cp "${NODE}:/tmp/cbcollect.zip" "${OI_LOG_DIR}/cbcollect.zip" 2>/dev/null \
+            && echo "collected cbcollect_info"
+        docker cp "${NODE}:/tmp/cbcollect.out" "${OI_LOG_DIR}/cbcollect.out" 2>/dev/null || true
+    fi
+    oi_bootstrap_evidence
+    ls -lR "$OI_LOG_DIR" | head -60
+}
+
+# Which provider served the cluster map, from both ends. The tests assert it
+# themselves; this is what to read when they stop doing so.
+oi_bootstrap_evidence() {
+    local out="${OI_LOG_DIR}/bootstrap-evidence.txt"
+    {
+        echo "=== server: the client's own config requests (http_access.log) ==="
+        echo "# One completed GET .../nodeServicesStreaming/ per instance the"
+        echo "# tests destroyed -- the entry is written when the stream closes,"
+        echo "# which is why the status reads 200 chunked and carries a duration."
+        echo "# The authenticated user is the token subject, so a 401 here is the"
+        echo "# server refusing an expired or forged token at the config request."
+        echo "# The peer address is the forwarder's, not the test container's."
+        grep -E 'libcouchbase' "${OI_LOG_DIR}/server-logs/http_access.log" 2>/dev/null \
+            || echo "(none -- see oi_await_access_log)"
+        echo
+        echo "=== client: which provider served the config (lcb-client.log) ==="
+        echo "# 'Static configuration provider' here would mean a synthesized map;"
+        echo "# the port says whether bootstrap went over TLS."
+        grep -E 'Configuration Provider|connected to REST API|Static configuration|Selected network' \
+            "${OI_LOG_DIR}/lcb-client.log" 2>/dev/null | sort -u || echo "(none)"
+    } >"$out" 2>&1
+    sed -n '1,60p' "$out"
+}
+
+oi_down() {
+    say "Cleaning up"
+    docker rm -f "$NODE" "$S3" "$PROXY" >/dev/null 2>&1 || true
+    docker network rm "$NET" >/dev/null 2>&1 || true
+}
+
+case "${1:-}" in
+    up) oi_up ;;
+    test) oi_test ;;
+    collect) oi_collect ;;
+    down) oi_down ;;
+    *)
+        echo "usage: $0 {up|test|collect|down}" >&2
+        exit 2
+        ;;
+esac
