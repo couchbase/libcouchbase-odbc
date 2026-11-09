@@ -109,6 +109,8 @@ TARGET_LINK_LIBRARIES(nonio-tests couchbaseS gtest)
 IF(NOT LCB_NO_SSL)
     # t_ssl_trust.cc inspects the OpenSSL error queue
     TARGET_INCLUDE_DIRECTORIES(nonio-tests PRIVATE ${OPENSSL_INCLUDE_DIR})
+    # t_jwt_analytics.cc signs its own HS256 tokens
+    TARGET_INCLUDE_DIRECTORIES(unit-tests PRIVATE ${OPENSSL_INCLUDE_DIR})
 ENDIF()
 TARGET_LINK_LIBRARIES(mc-tests couchbaseS gtest)
 TARGET_LINK_LIBRARIES(mc-malloc-tests couchbaseS gtest)
