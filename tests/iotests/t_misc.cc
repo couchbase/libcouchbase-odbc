@@ -388,6 +388,49 @@ TEST_F(MockUnitTest, testGetHostInfo)
     lcb_destroy(instance);
 }
 
+TEST_F(MockUnitTest, testHttpBootstrap)
+{
+    // Every other mock test takes its config over the memcached protocol, because
+    // makeConnectParams() pins bootstrap_on=cccp. Pin HTTP here instead, so the REST
+    // streaming provider in bucketconfig/bc_http.cc is exercised as well.
+    lcb_CREATEOPTS *cropts = nullptr;
+    MockEnvironment::getInstance()->makeConnectParams(cropts, nullptr);
+
+    std::string connstr(cropts->connstr, cropts->connstr_len);
+    std::string::size_type pos = connstr.find("bootstrap_on=");
+    if (pos == std::string::npos) {
+        connstr += (connstr.find('?') == std::string::npos) ? "?" : "&";
+        connstr += "bootstrap_on=http";
+    } else {
+        // Replace the existing selection; a duplicate bootstrap_on key is ambiguous.
+        std::string::size_type end = connstr.find('&', pos);
+        if (end == std::string::npos) {
+            end = connstr.size();
+        }
+        connstr.replace(pos, end - pos, "bootstrap_on=http");
+    }
+    lcb_createopts_connstr(cropts, connstr.c_str(), connstr.size());
+
+    lcb_INSTANCE *instance;
+    doLcbCreate(&instance, cropts, MockEnvironment::getInstance());
+    lcb_createopts_destroy(cropts);
+
+    ASSERT_EQ(LCB_SUCCESS, lcb_connect(instance));
+    ASSERT_EQ(LCB_SUCCESS, lcb_wait(instance, LCB_WAIT_DEFAULT));
+    ASSERT_EQ(LCB_SUCCESS, lcb_get_bootstrap_status(instance));
+
+    // CCCP must not have served this config.
+    lcb_BOOTSTRAP_TRANSPORT tx;
+    ASSERT_EQ(LCB_SUCCESS, lcb_cntl(instance, LCB_CNTL_GET, LCB_CNTL_CONFIG_TRANSPORT, &tx));
+    ASSERT_EQ(LCB_CONFIG_TRANSPORT_HTTP, tx);
+
+    // A streaming connection is open, and the map it carried is usable.
+    ASSERT_FALSE(nullptr == lcb_get_node(instance, LCB_NODE_HTCONFIG_CONNECTED, 0));
+    storeKey(instance, "testHttpBootstrap", "value");
+
+    lcb_destroy(instance);
+}
+
 extern "C" {
 static void store_callback(lcb_INSTANCE *instance, lcb_CALLBACK_TYPE, const lcb_RESPSTORE *resp)
 {
